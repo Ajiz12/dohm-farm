@@ -434,11 +434,7 @@ def do_stake(page, amount=0.2):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  stake confirm: {conf}")
-            if conf == 'confirmed':
-                wait_tx_confirm(page, "stake")
-                log("  stake settled")
-                return 'done'
-            return conf
+            return 'done' if conf == 'confirmed' else conf
         time.sleep(2)
     return 'failed-3x'
 
@@ -493,11 +489,7 @@ def do_unstake(page, amount=0.1):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  unstake confirm: {conf}")
-            if conf == 'confirmed':
-                wait_tx_confirm(page, "unstake")
-                log("  unstake settled")
-                return 'done'
-            return conf
+            return 'done' if conf == 'confirmed' else conf
         time.sleep(3)
     return 'failed-3x'
 
@@ -524,7 +516,7 @@ def do_claim(page):
                 b.click()
                 total += 1
                 log(f"  [claim] bond #{total} clicked, tunggu settle...")
-                wait_tx_confirm(page, f"claim-{total}", max_wait=300)
+                wait_tx_confirm(page, f"claim-{total}", max_wait=600)
             except Exception as e:
                 log(f"  [claim] err: {e}")
                 break
@@ -780,17 +772,25 @@ def run_farming_session():
                 time.sleep(60)
                 continue
 
-            # ── UNSTAKE (otomatis begitu stake settled) ──
+            # jeda 5-15s
+            wait = random.uniform(5, 15)
+            log(f"  ⏳ tunggu {wait:.0f}s...")
+            time.sleep(wait)
+
+            # ── UNSTAKE ──
             log(f"  [2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
             r2 = retry_action(lambda: do_unstake(page_main, UNSTAKE_AMOUNT), tries=3, label="unstake")
             log(f"  -> {r2}")
 
-            # ── CLAIM (tunggu settle per claim, max 5 menit) ──
+            # jeda 5-15s
+            wait = random.uniform(5, 15)
+            log(f"  ⏳ tunggu {wait:.0f}s...")
+            time.sleep(wait)
+
+            # ── CLAIM + tunggu PENDING hilang ──
             log(f"  [3/3] Claim matured bonds...")
             r3 = retry_action(lambda: do_claim(page_claim), tries=2, label="claim")
             log(f"  -> {r3}")
-
-            # PENDING HILANG → next cycle
 
             state['consecutive_fails'] = 0
             elapsed = (time.time() - cycle_start) / 3600
