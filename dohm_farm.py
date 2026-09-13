@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-DOHM Farming v16 - SEQUENTIAL FAST
+DOHM Farming v19 - ASYNC CLAIM
 Flow per cycle:
-  stake 0.2 -> tunggu pending hilang -> unstake 0.1 -> tunggu pending hilang
-  -> claim -> tunggu pending hilang -> WAJIB wait 10 menit -> next cycle
+  stake 0.2 -> jeda 5-15s -> unstake 0.1 -> jeda 5-15s
+  -> trigger claim (fire-and-forget) -> next cycle LANGSUNG
 
-Fitur:
-- Deteksi "PENDING in mempool ~10min" -> tunggu sampai hilang (polling 5s)
-- Auto retry, auto run 24/7, auto update, auto faucet, notif +25pts
+Claim jalan di thread terpisah, ga nge-block cycle.
 """
 import os
 import sys
@@ -35,13 +33,20 @@ if not WALLET_PASSWORD or not SEED_PHRASE:
 
 POINTS_TARGET = float(os.environ.get('POINTS_TARGET', '25000'))
 MAX_CYCLES    = int(os.environ.get('MAX_CYCLES', '0'))
-WAIT_MINUTES  = int(os.environ.get('WAIT_MINUTES', '10'))
-WAIT_JITTER   = int(os.environ.get('WAIT_JITTER', '60'))
 STAKE_AMOUNT  = float(os.environ.get('STAKE_AMOUNT', '0.2'))
 UNSTAKE_AMOUNT= float(os.environ.get('UNSTAKE_AMOUNT', '0.1'))
 
+JEDA_MIN = int(os.environ.get('JEDA_MIN', '5'))
+JEDA_MAX = int(os.environ.get('JEDA_MAX', '15'))
+
 TX_WAIT_MAX      = int(os.environ.get('TX_WAIT_MAX', '900'))
 TX_POLL_INTERVAL = int(os.environ.get('TX_POLL_INTERVAL', '5'))
+
+GRACE_MIN = int(os.environ.get('GRACE_MIN', '10'))
+GRACE_MAX = int(os.environ.get('GRACE_MAX', '20'))
+
+CLAIM_MIN_WAIT = int(os.environ.get('CLAIM_MIN_WAIT', '60'))
+CLAIM_MAX_WAIT = int(os.environ.get('CLAIM_MAX_WAIT', '600'))
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -70,7 +75,9 @@ state = {
     'initial_points': 0.0,
     'last_notify_pts': 0.0,
     'target_reached': False,
-    'consecutive_fails': 0,
+    'claim_ready': False,
+    'claim_running': False,
+    'claim_count': 0,
 }
 start_time = time.time()
 
@@ -81,7 +88,8 @@ _log_lock = threading.Lock()
 
 def log(msg):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    line = f"[{ts}] {msg}"
+    tid = threading.current_thread().name
+    line = f"[{ts}] [{tid}] {msg}"
     with _log_lock:
         print(line, flush=True)
         try:
@@ -128,7 +136,6 @@ def check_and_update():
         if hashlib.sha256(remote).hexdigest() == hashlib.sha256(local).hexdigest():
             log("[UPDATE] sudah terbaru")
             return False
-        log(f"[UPDATE] versi baru! replacing...")
         with open(SCRIPT_PATH + '.bak', 'wb') as f:
             f.write(local)
         with open(SCRIPT_PATH, 'wb') as f:
@@ -156,13 +163,12 @@ def acquire_lock():
 # ═══════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════
-def sleep_jitter(minutes, label=""):
-    total = minutes * 60 + random.randint(-WAIT_JITTER, WAIT_JITTER)
-    total = max(total, 60)
+def sleep_fixed(min_s=5, max_s=15, label=""):
+    total = random.uniform(min_s, max_s)
+    log(f"  [jeda] {label}: {total:.1f}s")
     end = time.time() + total
     while time.time() < end and not state['stop']:
-        time.sleep(min(5, end - time.time()))
-    log(f"  [wait] {label} done ({total // 60}m{total % 60}s)")
+        time.sleep(min(1, end - time.time()))
 
 def get_tx_hash(page):
     try:
@@ -327,14 +333,9 @@ def retry_action(fn, tries=3, base_delay=5, label=""):
     return 'failed-3x'
 
 # ═══════════════════════════════════════════
-# WAIT UNTIL PENDING GONE
+# WAIT TX CONFIRM (3-TAHAP)
 # ═══════════════════════════════════════════
 def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
-    """
-    Tunggu sampai tulisan 'PENDING / in mempool' HILANG.
-    Polling tiap poll_interval detik.
-    Return: 'confirmed' | 'timeout'
-    """
     if max_wait is None:
         max_wait = TX_WAIT_MAX
     if poll_interval is None:
@@ -342,11 +343,32 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
 
     start = time.time()
     last_log = 0
+
+    # Tahap 1: tunggu PENDING muncul
+    log(f"  [confirm] {action_label} tahap 1: tunggu PENDING muncul")
     pending_seen = False
+    t1_start = time.time()
+    while time.time() - t1_start < 30:
+        try:
+            body = page.inner_text('body') or ''
+        except Exception:
+            body = ''
+        if re.search(r'(pending|in\s*mempool|mempool|submitting|processing|broadcasting)',
+                     body, re.IGNORECASE):
+            pending_seen = True
+            m = re.search(r'pending[^\n]{0,80}', body, re.IGNORECASE)
+            snippet = m.group(0).strip() if m else 'pending...'
+            log(f"  [confirm] {action_label} pending MUNCUL: {snippet[:70]}")
+            break
+        time.sleep(2)
+
+    if not pending_seen:
+        log(f"  [confirm] {action_label} pending ga muncul, skip ke grace")
+
+    # Tahap 2: tunggu PENDING hilang
+    log(f"  [confirm] {action_label} tahap 2: tunggu PENDING hilang")
     settled_count = 0
-
-    log(f"  [confirm] {action_label} wait until pending gone (max {max_wait}s)")
-
+    pending_gone = False
     while time.time() - start < max_wait:
         elapsed = time.time() - start
         try:
@@ -358,23 +380,8 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
             r'(pending|in\s*mempool|mempool|waiting\s+for\s+confirmation|'
             r'submitting|processing|broadcasting|queued)',
             body, re.IGNORECASE))
-        is_success = bool(re.search(
-            r'\b(success|confirmed|complete[d]?|settled|done|finalized)\b',
-            body, re.IGNORECASE))
-
-        btn_enabled = False
-        try:
-            for lbl in ('Stake DOHM', 'Unstake DOHM', 'Claim'):
-                btn = page.locator(f'button:has-text("{lbl}"):visible')
-                if btn.count() > 0:
-                    if btn.first.get_attribute('disabled', timeout=500) is None:
-                        btn_enabled = True
-                        break
-        except Exception:
-            pass
 
         if is_pending:
-            pending_seen = True
             settled_count = 0
             if time.time() - last_log > 20:
                 m = re.search(r'pending[^\n]{0,80}', body, re.IGNORECASE)
@@ -385,29 +392,44 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
             if pending_seen:
                 settled_count += 1
                 if settled_count >= 2:
-                    log(f"  [confirm] {action_label} ✅ PENDING HILANG ({elapsed:.1f}s)")
-                    return 'confirmed'
+                    log(f"  [confirm] {action_label} ✅ PENDING HILANG di {elapsed:.1f}s")
+                    pending_gone = True
+                    break
             else:
-                if elapsed < 5:
-                    pass
-                elif is_success or btn_enabled:
-                    settled_count += 1
-                    if settled_count >= 2:
-                        log(f"  [confirm] {action_label} ✅ settled tanpa pending ({elapsed:.1f}s)")
-                        return 'confirmed'
-                else:
-                    if time.time() - last_log > 20:
-                        log(f"  [confirm] {action_label} status unclear ({elapsed:.0f}s)")
-                        last_log = time.time()
-
+                if elapsed >= 5:
+                    log(f"  [confirm] {action_label} ✅ settled (ga ada pending) di {elapsed:.1f}s")
+                    pending_gone = True
+                    break
         time.sleep(poll_interval)
 
-    log(f"  [confirm] {action_label} ⚠️ TIMEOUT {max_wait}s, lanjut aja")
-    return 'timeout'
+    if not pending_gone:
+        log(f"  [confirm] {action_label} ⚠️ TIMEOUT {max_wait}s")
+        return 'timeout'
+
+    # Tahap 3: grace period
+    grace = random.uniform(GRACE_MIN, GRACE_MAX)
+    log(f"  [confirm] {action_label} tahap 3: grace {grace:.0f}s")
+    grace_end = time.time() + grace
+    while time.time() < grace_end and not state['stop']:
+        time.sleep(1)
+
+    log(f"  [confirm] {action_label} ✅ done")
+    return 'confirmed'
 
 # ═══════════════════════════════════════════
 # ACTIONS
 # ═══════════════════════════════════════════
+def get_sohm_balance(page):
+    try:
+        txt = page.inner_text('body') or ''
+        for pat in (r'(\d+\.?\d*)\s*sDOHM', r'[Bb]alance\s+(\d+\.?\d*)\s*sDOHM'):
+            m = re.search(pat, txt, re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+    except Exception:
+        pass
+    return 0
+
 def do_stake(page, amount=0.2):
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     for _ in range(6):
@@ -434,20 +456,12 @@ def do_stake(page, amount=0.2):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  stake confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+            if conf == 'confirmed':
+                wait_tx_confirm(page, "stake")
+                return 'done'
+            return conf
         time.sleep(2)
     return 'failed-3x'
-
-def get_sohm_balance(page):
-    try:
-        txt = page.inner_text('body') or ''
-        for pat in (r'(\d+\.?\d*)\s*sDOHM', r'[Bb]alance\s+(\d+\.?\d*)\s*sDOHM'):
-            m = re.search(pat, txt, re.IGNORECASE)
-            if m:
-                return float(m.group(1))
-    except Exception:
-        pass
-    return 0
 
 def do_unstake(page, amount=0.1):
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
@@ -489,11 +503,15 @@ def do_unstake(page, amount=0.1):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  unstake confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+            if conf == 'confirmed':
+                wait_tx_confirm(page, "unstake")
+                return 'done'
+            return conf
         time.sleep(3)
     return 'failed-3x'
 
 def do_claim(page):
+    """Claim semua matured bonds. Dipanggil CLM thread."""
     page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
     for _ in range(20):
         time.sleep(1)
@@ -516,7 +534,7 @@ def do_claim(page):
                 b.click()
                 total += 1
                 log(f"  [claim] bond #{total} clicked, tunggu settle...")
-                wait_tx_confirm(page, f"claim-{total}", max_wait=600)
+                wait_tx_confirm(page, f"claim-{total}", max_wait=CLAIM_MAX_WAIT)
             except Exception as e:
                 log(f"  [claim] err: {e}")
                 break
@@ -575,7 +593,7 @@ def try_claim_faucet(page):
         # STEP 1: menu Link
         link_menu = _find_visible(page, [
             'a:has-text("Link")', 'button:has-text("Link")',
-            '[role="tab"]:has-text("Link")', 'text=/^Link$/i',
+            '[role="tab"]:has-text("Link")', 'text="Link"',
         ])
         if not link_menu:
             log("[FAUCET] menu 'Link' ga ketemu")
@@ -679,19 +697,58 @@ def try_claim_faucet(page):
         return 'error'
 
 # ═══════════════════════════════════════════
-# CYCLE RUNNER
+# CLAIM THREAD (async)
+# ═══════════════════════════════════════════
+def claim_worker(browser):
+    """CLM thread: tunggu claim_ready, buka page baru, claim, repeat."""
+    thread_name = threading.current_thread().name
+    log(f"  [CLM] {thread_name} started")
+
+    while not state['stop']:
+        if not state['claim_ready']:
+            time.sleep(2)
+            continue
+
+        state['claim_ready'] = False
+        state['claim_running'] = True
+        log("  [CLM] claim_ready=True, mulai claim...")
+
+        try:
+            page = browser.new_page()
+            result = do_claim(page)
+            state['claim_count'] += 1
+            log(f"  [CLM] claim #{state['claim_count']} selesai: {result}")
+            page.close()
+        except Exception as e:
+            log(f"  [CLM] error: {e}")
+            log(traceback.format_exc())
+
+        state['claim_running'] = False
+
+        # Jeda antar claim
+        wait = random.uniform(CLAIM_MIN_WAIT, CLAIM_MAX_WAIT)
+        log(f"  [CLM] jeda {wait:.0f}s sebelum claim berikutnya")
+        wait_end = time.time() + wait
+        while time.time() < wait_end and not state['stop']:
+            time.sleep(2)
+
+    log(f"  [CLM] {thread_name} stopped")
+
+# ═══════════════════════════════════════════
+# CYCLE RUNNER (SEQ)
 # ═══════════════════════════════════════════
 def run_farming_session():
-    log(f"[INIT] DOHM Farm v16 | {datetime.now()}")
+    log(f"[INIT] DOHM Farm v19 | {datetime.now()}")
     log(f"[INIT] Target: {POINTS_TARGET} pts | Notif tiap +{NOTIFY_EVERY_PTS} pts")
-    log(f"[INIT] TX_WAIT_MAX={TX_WAIT_MAX}s | TX_POLL={TX_POLL_INTERVAL}s")
+    log(f"[INIT] Flow: Stake → {JEDA_MIN}-{JEDA_MAX}s → Unstake → {JEDA_MIN}-{JEDA_MAX}s → Claim(async) → next")
+    log(f"[INIT] Claim thread: min={CLAIM_MIN_WAIT}s max={CLAIM_MAX_WAIT}s antar claim")
+    log(f"[INIT] Grace: {GRACE_MIN}-{GRACE_MAX}s | TX_WAIT_MAX={TX_WAIT_MAX}s")
     if FAUCET_ENABLED:
         log(f"[INIT] Faucet: ON (cek tiap {FAUCET_MIN_HOURS}-{FAUCET_MAX_HOURS} jam)")
-    notify(f"🚀 <b>DOHM Farm v16 start</b>\nTarget: {POINTS_TARGET} pts\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
+    notify(f"🚀 <b>DOHM Farm v19 start</b>\nTarget: {POINTS_TARGET} pts\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
 
     with Camoufox(headless=True) as browser:
         page_main = browser.new_page()
-        page_claim = browser.new_page()
 
         page_main.goto(URL_STAKE, wait_until='load', timeout=30000)
         time.sleep(5)
@@ -703,6 +760,11 @@ def run_farming_session():
         log(f"[INIT] Points: {initial_points:.2f} | Target: {POINTS_TARGET}")
         notify(f"📊 <b>Starting points:</b> {initial_points:.2f}")
 
+        # Start CLM thread
+        clm_thread = threading.Thread(target=claim_worker, args=(browser,), name="CLM", daemon=True)
+        clm_thread.start()
+        log("[INIT] CLM thread started")
+
         cycle_start = time.time()
         cycle_num = 0
         next_faucet_time = time.time()
@@ -711,6 +773,7 @@ def run_farming_session():
             cycle_num += 1
             if MAX_CYCLES > 0 and cycle_num > MAX_CYCLES:
                 log(f"[END] Max cycles ({MAX_CYCLES}) reached.")
+                state['stop'] = True
                 return True
 
             log(f"\n{'=' * 60}")
@@ -719,7 +782,7 @@ def run_farming_session():
             log(f"{'=' * 60}")
 
             pts = get_points(page_main)
-            heartbeat(f"cycle={cycle_num} pts={pts:.2f}")
+            heartbeat(f"cycle={cycle_num} pts={pts:.2f} claims={state['claim_count']}")
 
             # ── CEK TARGET ──
             if pts >= POINTS_TARGET:
@@ -727,16 +790,18 @@ def run_farming_session():
                     f"🎯 <b>TARGET TERCAPAI!</b>\n"
                     f"Points: <b>{pts:.2f}</b> / {POINTS_TARGET}\n"
                     f"Cycles: {cycle_num}\n"
+                    f"Claims: {state['claim_count']}\n"
                     f"Elapsed: {(time.time() - cycle_start) / 3600:.2f}h"
                 )
                 log(f"[GOAL] {msg}")
                 notify(msg)
+                state['stop'] = True
                 return True
 
             # ── NOTIF TIAP N PTS ──
             if pts - state['last_notify_pts'] >= NOTIFY_EVERY_PTS:
                 gained = pts - state['initial_points']
-                notify(f"📈 <b>{pts:.2f} pts</b> (+{gained:.2f} total)\nCycle: {cycle_num}")
+                notify(f"📈 <b>{pts:.2f} pts</b> (+{gained:.2f} total)\nCycle: {cycle_num} | Claims: {state['claim_count']}")
                 state['last_notify_pts'] = pts
 
             log(f"  pts: {pts:.2f}")
@@ -761,46 +826,39 @@ def run_farming_session():
                 page_main.goto(URL_STAKE, wait_until='load', timeout=30000)
                 time.sleep(3)
 
+            # ════════════════════════════════════════
+            # SEQ: Stake → jeda → Unstake → jeda → trigger claim
+            # ════════════════════════════════════════
+
             # ── STAKE ──
-            log(f"  [1/3] Stake {STAKE_AMOUNT} DOHM...")
+            log(f"  [SEQ 1/3] Stake {STAKE_AMOUNT} DOHM...")
             r1 = retry_action(lambda: do_stake(page_main, STAKE_AMOUNT), tries=3, label="stake")
             log(f"  -> {r1}")
             if r1 != 'done':
                 log(f"  [!] stake gagal ({r1}), skip cycle")
                 notify(f"⚠️ Stake gagal di cycle {cycle_num}: {r1}")
-                state['consecutive_fails'] += 1
                 time.sleep(60)
                 continue
 
-            # jeda 5-15s
-            wait = random.uniform(5, 15)
-            log(f"  ⏳ tunggu {wait:.0f}s...")
-            time.sleep(wait)
+            sleep_fixed(JEDA_MIN, JEDA_MAX, "stake→unstake")
 
             # ── UNSTAKE ──
-            log(f"  [2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
+            log(f"  [SEQ 2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
             r2 = retry_action(lambda: do_unstake(page_main, UNSTAKE_AMOUNT), tries=3, label="unstake")
             log(f"  -> {r2}")
 
-            # jeda 5-15s
-            wait = random.uniform(5, 15)
-            log(f"  ⏳ tunggu {wait:.0f}s...")
-            time.sleep(wait)
+            sleep_fixed(JEDA_MIN, JEDA_MAX, "unstake→claim")
 
-            # ── CLAIM + tunggu PENDING hilang ──
-            log(f"  [3/3] Claim matured bonds...")
-            r3 = retry_action(lambda: do_claim(page_claim), tries=2, label="claim")
-            log(f"  -> {r3}")
+            # ── TRIGGER CLAIM (fire-and-forget) ──
+            log("  [SEQ 3/3] Trigger claim (async)...")
+            if state['claim_running']:
+                log("  [SEQ] CLM masih jalan, skip trigger")
+            else:
+                state['claim_ready'] = True
+                log("  [SEQ] claim_ready=True → CLM thread akan claim")
 
-            state['consecutive_fails'] = 0
-            elapsed = (time.time() - cycle_start) / 3600
-            pts_now = get_points(page_main)
-            gained = pts_now - state['initial_points']
-            log(f"  cycle {cycle_num} done. pts={pts_now:.2f} | elapsed={elapsed:.2f}h | gained={gained:.2f}")
-
-            if pts_now - state['last_notify_pts'] >= NOTIFY_EVERY_PTS:
-                notify(f"📈 <b>{pts_now:.2f} pts</b> (+{gained:.2f} total)\nCycle: {cycle_num}")
-                state['last_notify_pts'] = pts_now
+            # ── NEXT CYCLE LANGSUNG ──
+            log("  [SEQ] next cycle!")
 
 # ═══════════════════════════════════════════
 # SUPERVISOR
@@ -816,7 +874,7 @@ if __name__ == '__main__':
             done = run_farming_session()
             if done:
                 log("[SUPERVISOR] Selesai. Exit.")
-                notify("✅ <b>DOHM Farm selesai</b>")
+                notify(f"✅ <b>DOHM Farm selesai</b>\nClaims: {state['claim_count']}")
                 break
             else:
                 log("[SUPERVISOR] Session ended, restart in 30s...")
