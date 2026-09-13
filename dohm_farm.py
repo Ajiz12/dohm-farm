@@ -780,17 +780,23 @@ def run_farming_session():
                 time.sleep(60)
                 continue
 
+            log("  ⏳ tunggu 30 detik...")
+            time.sleep(30)
+
             # ── UNSTAKE ──
             log(f"  [2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
             r2 = retry_action(lambda: do_unstake(page_main, UNSTAKE_AMOUNT), tries=3, label="unstake")
             log(f"  -> {r2}")
+
+            log("  ⏳ tunggu 30 detik...")
+            time.sleep(30)
 
             # ── CLAIM ──
             log(f"  [3/3] Claim matured bonds...")
             r3 = retry_action(lambda: do_claim(page_claim), tries=2, label="claim")
             log(f"  -> {r3}")
 
-            # ── WAJIB WAIT ──
+            # ── WAJIB WAIT 10 MENIT ──
             sleep_jitter(WAIT_MINUTES, "setelah cycle")
 
             state['consecutive_fails'] = 0
