@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-DOHM Farming v19 - ASYNC CLAIM
+DOHM Farming v19.1 - ASYNC CLAIM + HEALTH CHECK
 Flow per cycle:
   stake 0.2 -> jeda 5-15s -> unstake 0.1 -> jeda 5-15s
-  -> trigger claim (fire-and-forget) -> next cycle LANGSUNG
+  -> queue claim (fire-and-forget) -> next cycle LANGSUNG
 
-Claim jalan di thread terpisah, ga nge-block cycle.
+Claim jalan di thread terpisah (CLM), ga nge-block cycle.
+Health monitor (HLT) cek browser tiap 15s, auto-restart kalau crash.
 """
 import os
 import sys
@@ -59,6 +60,8 @@ FAUCET_MAX_HOURS = float(os.environ.get('FAUCET_MAX_HOURS', '12'))
 AUTO_UPDATE = int(os.environ.get('AUTO_UPDATE', '0'))
 UPDATE_URL  = os.environ.get('UPDATE_URL', '')
 
+HEALTH_CHECK_INTERVAL = int(os.environ.get('HEALTH_CHECK_INTERVAL', '15'))
+
 URL_STAKE     = 'https://testnet.dohm.finance/app/stake'
 URL_PORTFOLIO = 'https://testnet.dohm.finance/app/portfolio'
 URL_SETUP     = 'https://testnet.dohm.finance/app/setup'
@@ -75,10 +78,14 @@ state = {
     'initial_points': 0.0,
     'last_notify_pts': 0.0,
     'target_reached': False,
+    'browser_dead': False,
+    'thread_died': None,
     'claim_ready': False,
     'claim_running': False,
     'claim_count': 0,
+    'current_cycle': 0,
 }
+
 start_time = time.time()
 
 # ═══════════════════════════════════════════
@@ -120,6 +127,58 @@ def heartbeat(payload: str):
             f.write(f"{datetime.now().isoformat()} | {payload}\n")
     except Exception:
         pass
+
+# ═══════════════════════════════════════════
+# HEALTH CHECK
+# ═══════════════════════════════════════════
+def is_browser_alive(page):
+    try:
+        if page is None:
+            return False
+        if page.is_closed():
+            return False
+        _ = page.url
+        return True
+    except Exception:
+        return False
+
+def worker_health(pages_ref):
+    """HLT thread: cek semua page tiap HEALTH_CHECK_INTERVAL detik."""
+    threading.current_thread().name = "HLT"
+    try:
+        log("[HLT] health monitor start")
+        while not state['stop'] and not state['target_reached']:
+            time.sleep(HEALTH_CHECK_INTERVAL)
+            if state['browser_dead']:
+                break
+            pages = pages_ref[0] if pages_ref else {}
+            dead = []
+            for name, pg in pages.items():
+                if pg is not None and not is_browser_alive(pg):
+                    dead.append(name)
+            if dead:
+                log(f"[HLT] ⚠️ page mati: {dead}")
+                state['browser_dead'] = True
+                state['thread_died'] = f"pages:{','.join(dead)}"
+                break
+        log("[HLT] health monitor stop")
+    except Exception as e:
+        log(f"[HLT] CRASH: {e}")
+        log(traceback.format_exc())
+        state['browser_dead'] = True
+        state['thread_died'] = "HLT"
+
+def thread_wrapper(name, target, *args, **kwargs):
+    def inner():
+        threading.current_thread().name = name
+        try:
+            target(*args, **kwargs)
+        except Exception as e:
+            log(f"[{name}] !!! THREAD DIED: {e}")
+            log(traceback.format_exc())
+            state['thread_died'] = name
+            state['browser_dead'] = True
+    return inner
 
 # ═══════════════════════════════════════════
 # AUTO UPDATE
@@ -319,7 +378,7 @@ def click_confirm_sign(page, timeout=30):
 
 def retry_action(fn, tries=3, base_delay=5, label=""):
     for i in range(tries):
-        if state['stop']:
+        if state['stop'] or state['browser_dead']:
             return 'stopped'
         try:
             r = fn()
@@ -328,6 +387,11 @@ def retry_action(fn, tries=3, base_delay=5, label=""):
             log(f"  [retry:{label}] {i + 1}/{tries} -> {r}")
         except Exception as e:
             log(f"  [retry:{label}] {i + 1}/{tries} err: {e}")
+            if 'closed' in str(e).lower() or 'target page' in str(e).lower():
+                log(f"  [retry:{label}] browser closed, bail")
+                state['browser_dead'] = True
+                state['thread_died'] = label
+                return 'browser-dead'
         if i < tries - 1:
             time.sleep(base_delay * (2 ** i))
     return 'failed-3x'
@@ -344,11 +408,12 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
     start = time.time()
     last_log = 0
 
-    # Tahap 1: tunggu PENDING muncul
     log(f"  [confirm] {action_label} tahap 1: tunggu PENDING muncul")
     pending_seen = False
     t1_start = time.time()
     while time.time() - t1_start < 30:
+        if state['browser_dead']:
+            return 'timeout'
         try:
             body = page.inner_text('body') or ''
         except Exception:
@@ -365,11 +430,12 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
     if not pending_seen:
         log(f"  [confirm] {action_label} pending ga muncul, skip ke grace")
 
-    # Tahap 2: tunggu PENDING hilang
     log(f"  [confirm] {action_label} tahap 2: tunggu PENDING hilang")
     settled_count = 0
     pending_gone = False
     while time.time() - start < max_wait:
+        if state['browser_dead']:
+            return 'timeout'
         elapsed = time.time() - start
         try:
             body = page.inner_text('body') or ''
@@ -406,11 +472,10 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
         log(f"  [confirm] {action_label} ⚠️ TIMEOUT {max_wait}s")
         return 'timeout'
 
-    # Tahap 3: grace period
     grace = random.uniform(GRACE_MIN, GRACE_MAX)
     log(f"  [confirm] {action_label} tahap 3: grace {grace:.0f}s")
     grace_end = time.time() + grace
-    while time.time() < grace_end and not state['stop']:
+    while time.time() < grace_end and not state['stop'] and not state['browser_dead']:
         time.sleep(1)
 
     log(f"  [confirm] {action_label} ✅ done")
@@ -505,7 +570,6 @@ def do_unstake(page, amount=0.1):
     return 'failed-3x'
 
 def do_claim(page):
-    """Claim semua matured bonds. Dipanggil CLM thread."""
     page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
     for _ in range(20):
         time.sleep(1)
@@ -520,6 +584,8 @@ def do_claim(page):
             break
         log(f"  [claim] round {rnd + 1}: {n} tombol")
         for _ in range(n):
+            if state['browser_dead']:
+                break
             b = page.locator('button:has-text("Claim"):not([disabled]):visible').first
             if b.count() == 0:
                 break
@@ -531,6 +597,9 @@ def do_claim(page):
                 wait_tx_confirm(page, f"claim-{total}", max_wait=CLAIM_MAX_WAIT)
             except Exception as e:
                 log(f"  [claim] err: {e}")
+                if 'closed' in str(e).lower():
+                    state['browser_dead'] = True
+                    return 'browser-dead'
                 break
         try:
             page.reload(wait_until='load', timeout=30000)
@@ -693,56 +762,65 @@ def try_claim_faucet(page):
 # ═══════════════════════════════════════════
 # CLAIM THREAD (async)
 # ═══════════════════════════════════════════
-def claim_worker(browser):
+def claim_worker(browser, pages_ref):
     """CLM thread: tunggu claim_ready, buka page baru, claim, repeat."""
-    thread_name = threading.current_thread().name
-    log(f"  [CLM] {thread_name} started")
-
-    while not state['stop']:
+    log("[CLM] started")
+    while not state['stop'] and not state['browser_dead']:
         if not state['claim_ready']:
             time.sleep(2)
             continue
 
         state['claim_ready'] = False
         state['claim_running'] = True
-        log("  [CLM] claim_ready=True, mulai claim...")
+        log("[CLM] claim_ready=True, mulai claim...")
 
         try:
             page = browser.new_page()
+            pages_ref[0]['claim'] = page
             result = do_claim(page)
             state['claim_count'] += 1
-            log(f"  [CLM] claim #{state['claim_count']} selesai: {result}")
-            page.close()
+            log(f"[CLM] claim #{state['claim_count']} selesai: {result}")
+            try:
+                page.close()
+            except Exception:
+                pass
+            pages_ref[0].pop('claim', None)
         except Exception as e:
-            log(f"  [CLM] error: {e}")
+            log(f"[CLM] error: {e}")
             log(traceback.format_exc())
+            state['browser_dead'] = True
+            state['thread_died'] = "CLM"
 
         state['claim_running'] = False
 
-        # Jeda antar claim
+        if state['browser_dead']:
+            break
+
         wait = random.uniform(CLAIM_MIN_WAIT, CLAIM_MAX_WAIT)
-        log(f"  [CLM] jeda {wait:.0f}s sebelum claim berikutnya")
+        log(f"[CLM] jeda {wait:.0f}s sebelum claim berikutnya")
         wait_end = time.time() + wait
-        while time.time() < wait_end and not state['stop']:
+        while time.time() < wait_end and not state['stop'] and not state['browser_dead']:
             time.sleep(2)
 
-    log(f"  [CLM] {thread_name} stopped")
+    log("[CLM] stopped")
 
 # ═══════════════════════════════════════════
 # CYCLE RUNNER (SEQ)
 # ═══════════════════════════════════════════
 def run_farming_session():
-    log(f"[INIT] DOHM Farm v19 | {datetime.now()}")
+    log(f"[INIT] DOHM Farm v19.1 | {datetime.now()}")
     log(f"[INIT] Target: {POINTS_TARGET} pts | Notif tiap +{NOTIFY_EVERY_PTS} pts")
     log(f"[INIT] Flow: Stake → {JEDA_MIN}-{JEDA_MAX}s → Unstake → {JEDA_MIN}-{JEDA_MAX}s → Claim(async) → next")
-    log(f"[INIT] Claim thread: min={CLAIM_MIN_WAIT}s max={CLAIM_MAX_WAIT}s antar claim")
-    log(f"[INIT] Grace: {GRACE_MIN}-{GRACE_MAX}s | TX_WAIT_MAX={TX_WAIT_MAX}s")
+    log(f"[INIT] Health check: {HEALTH_CHECK_INTERVAL}s interval")
     if FAUCET_ENABLED:
         log(f"[INIT] Faucet: ON (cek tiap {FAUCET_MIN_HOURS}-{FAUCET_MAX_HOURS} jam)")
-    notify(f"🚀 <b>DOHM Farm v19 start</b>\nTarget: {POINTS_TARGET} pts\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
+    notify(f"🚀 <b>DOHM Farm v19.1 start</b>\nTarget: {POINTS_TARGET} pts\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
 
     with Camoufox(headless=True) as browser:
         page_main = browser.new_page()
+
+        # pages_ref = [dict] — mutable container threads share
+        pages_ref = [{'main': page_main}]
 
         page_main.goto(URL_STAKE, wait_until='load', timeout=30000)
         time.sleep(5)
@@ -754,8 +832,16 @@ def run_farming_session():
         log(f"[INIT] Points: {initial_points:.2f} | Target: {POINTS_TARGET}")
         notify(f"📊 <b>Starting points:</b> {initial_points:.2f}")
 
-        # Start CLM thread
-        clm_thread = threading.Thread(target=claim_worker, args=(browser,), name="CLM", daemon=True)
+        # Reset flags
+        state['browser_dead'] = False
+        state['thread_died'] = None
+
+        # Start threads
+        hlt_thread = threading.Thread(target=worker_health, args=(pages_ref,), name="HLT", daemon=True)
+        hlt_thread.start()
+        log("[INIT] HLT thread started")
+
+        clm_thread = threading.Thread(target=thread_wrapper("CLM", claim_worker, browser, pages_ref), name="CLM", daemon=True)
         clm_thread.start()
         log("[INIT] CLM thread started")
 
@@ -763,8 +849,10 @@ def run_farming_session():
         cycle_num = 0
         next_faucet_time = time.time()
 
-        while not state['stop']:
+        while not state['stop'] and not state['browser_dead']:
             cycle_num += 1
+            state['current_cycle'] = cycle_num
+
             if MAX_CYCLES > 0 and cycle_num > MAX_CYCLES:
                 log(f"[END] Max cycles ({MAX_CYCLES}) reached.")
                 state['stop'] = True
@@ -809,6 +897,8 @@ def run_farming_session():
                 log("  [faucet] checking...")
                 faucet_result = retry_action(lambda: try_claim_faucet(page_main), tries=2, label="faucet")
                 log(f"  [faucet] result: {faucet_result}")
+                if faucet_result == 'browser-dead':
+                    break
                 if faucet_result in ('claimed', 'cooldown'):
                     delay_hours = random.uniform(FAUCET_MIN_HOURS, FAUCET_MAX_HOURS)
                     next_faucet_time = time.time() + delay_hours * 3600
@@ -828,6 +918,8 @@ def run_farming_session():
             log(f"  [SEQ 1/3] Stake {STAKE_AMOUNT} DOHM...")
             r1 = retry_action(lambda: do_stake(page_main, STAKE_AMOUNT), tries=3, label="stake")
             log(f"  -> {r1}")
+            if r1 == 'browser-dead':
+                break
             if r1 != 'done':
                 log(f"  [!] stake gagal ({r1}), skip cycle")
                 notify(f"⚠️ Stake gagal di cycle {cycle_num}: {r1}")
@@ -840,6 +932,8 @@ def run_farming_session():
             log(f"  [SEQ 2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
             r2 = retry_action(lambda: do_unstake(page_main, UNSTAKE_AMOUNT), tries=3, label="unstake")
             log(f"  -> {r2}")
+            if r2 == 'browser-dead':
+                break
 
             sleep_fixed(JEDA_MIN, JEDA_MAX, "unstake→claim")
 
@@ -851,11 +945,19 @@ def run_farming_session():
                 state['claim_ready'] = True
                 log("  [SEQ] claim_ready=True → CLM thread akan claim")
 
-            # ── NEXT CYCLE LANGSUNG ──
             log("  [SEQ] next cycle!")
 
+        # ── BROWSER CRASH → kembali ke supervisor ──
+        if state['browser_dead']:
+            died = state['thread_died'] or 'unknown'
+            log(f"[SESSION] Browser dead (thread: {died}), return ke supervisor")
+            notify(f"⚠️ <b>Browser crash!</b>\nThread: {died}\nCycle: {cycle_num}\nClaims: {state['claim_count']}")
+            return False
+
+        return True
+
 # ═══════════════════════════════════════════
-# SUPERVISOR
+# SUPERVISOR (auto-restart browser)
 # ═══════════════════════════════════════════
 if __name__ == '__main__':
     lock = acquire_lock()
@@ -865,14 +967,23 @@ if __name__ == '__main__':
     restart_count = 0
     while True:
         try:
+            # Reset state untuk fresh session
+            state['browser_dead'] = False
+            state['thread_died'] = None
+            state['claim_ready'] = False
+            state['claim_running'] = False
+
             done = run_farming_session()
             if done:
                 log("[SUPERVISOR] Selesai. Exit.")
                 notify(f"✅ <b>DOHM Farm selesai</b>\nClaims: {state['claim_count']}")
                 break
             else:
-                log("[SUPERVISOR] Session ended, restart in 30s...")
-                time.sleep(30)
+                restart_count += 1
+                delay = min(300, 15 * restart_count)
+                log(f"[SUPERVISOR] Browser crash, restart #{restart_count} in {delay}s...")
+                notify(f"🔄 <b>Auto-restart #{restart_count}</b>\nDelay: {delay}s")
+                time.sleep(delay)
         except KeyboardInterrupt:
             log("[SUPERVISOR] Ctrl+C, exit.")
             notify("🛑 DOHM Farm dihentikan manual.")
