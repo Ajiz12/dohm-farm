@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-DOHM Farming v13 (FULL)
-- Target 25000 pts
-- Notif Telegram tiap +25 pts (bukan tiap tx)
-- Auto claim faucet di /app/setup (Link -> wallet Linked -> Continue -> Get BTC -> Get frBTC)
-- Cek faucet tiap 6-12 jam random
-- Auto retry, auto run 24/7, auto update
+DOHM Farming v16 - SEQUENTIAL FAST
+Flow per cycle:
+  stake 0.2 -> tunggu pending hilang -> unstake 0.1 -> tunggu pending hilang
+  -> claim -> tunggu pending hilang -> WAJIB wait 10 menit -> next cycle
+
+Fitur:
+- Deteksi "PENDING in mempool ~10min" -> tunggu sampai hilang (polling 5s)
+- Auto retry, auto run 24/7, auto update, auto faucet, notif +25pts
 """
 import os
 import sys
@@ -15,6 +17,7 @@ import random
 import fcntl
 import hashlib
 import traceback
+import threading
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -37,6 +40,9 @@ WAIT_JITTER   = int(os.environ.get('WAIT_JITTER', '60'))
 STAKE_AMOUNT  = float(os.environ.get('STAKE_AMOUNT', '0.2'))
 UNSTAKE_AMOUNT= float(os.environ.get('UNSTAKE_AMOUNT', '0.1'))
 
+TX_WAIT_MAX      = int(os.environ.get('TX_WAIT_MAX', '900'))
+TX_POLL_INTERVAL = int(os.environ.get('TX_POLL_INTERVAL', '5'))
+
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
 NOTIFY_EVERY_PTS   = float(os.environ.get('NOTIFY_EVERY_PTS', '25'))
@@ -45,9 +51,8 @@ FAUCET_ENABLED   = int(os.environ.get('FAUCET_ENABLED', '1'))
 FAUCET_MIN_HOURS = float(os.environ.get('FAUCET_MIN_HOURS', '6'))
 FAUCET_MAX_HOURS = float(os.environ.get('FAUCET_MAX_HOURS', '12'))
 
-AUTO_UPDATE              = int(os.environ.get('AUTO_UPDATE', '0'))
-UPDATE_URL               = os.environ.get('UPDATE_URL', '')
-UPDATE_CHECK_EVERY_CYCLE = int(os.environ.get('UPDATE_CHECK_EVERY_CYCLE', '5'))
+AUTO_UPDATE = int(os.environ.get('AUTO_UPDATE', '0'))
+UPDATE_URL  = os.environ.get('UPDATE_URL', '')
 
 URL_STAKE     = 'https://testnet.dohm.finance/app/stake'
 URL_PORTFOLIO = 'https://testnet.dohm.finance/app/portfolio'
@@ -58,17 +63,32 @@ HEARTBEAT_FILE= '/tmp/dohm_farm.heartbeat'
 SCRIPT_PATH   = os.path.abspath(__file__)
 
 # ═══════════════════════════════════════════
+# GLOBAL STATE
+# ═══════════════════════════════════════════
+state = {
+    'stop': False,
+    'initial_points': 0.0,
+    'last_notify_pts': 0.0,
+    'target_reached': False,
+    'consecutive_fails': 0,
+}
+start_time = time.time()
+
+# ═══════════════════════════════════════════
 # LOG + NOTIF
 # ═══════════════════════════════════════════
+_log_lock = threading.Lock()
+
 def log(msg):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     line = f"[{ts}] {msg}"
-    print(line, flush=True)
-    try:
-        with open(LOG_FILE, 'a') as f:
-            f.write(line + '\n')
-    except Exception:
-        pass
+    with _log_lock:
+        print(line, flush=True)
+        try:
+            with open(LOG_FILE, 'a') as f:
+                f.write(line + '\n')
+        except Exception:
+            pass
 
 def notify(msg):
     log(f"[NOTIF] {msg}")
@@ -108,7 +128,7 @@ def check_and_update():
         if hashlib.sha256(remote).hexdigest() == hashlib.sha256(local).hexdigest():
             log("[UPDATE] sudah terbaru")
             return False
-        log(f"[UPDATE] versi baru! {hashlib.sha256(local).hexdigest()[:8]} -> {hashlib.sha256(remote).hexdigest()[:8]}")
+        log(f"[UPDATE] versi baru! replacing...")
         with open(SCRIPT_PATH + '.bak', 'wb') as f:
             f.write(local)
         with open(SCRIPT_PATH, 'wb') as f:
@@ -136,12 +156,12 @@ def acquire_lock():
 # ═══════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════
-def sleep_minutes(minutes, label=""):
+def sleep_jitter(minutes, label=""):
     total = minutes * 60 + random.randint(-WAIT_JITTER, WAIT_JITTER)
     total = max(total, 60)
     end = time.time() + total
-    while time.time() < end:
-        time.sleep(min(30, end - time.time()))
+    while time.time() < end and not state['stop']:
+        time.sleep(min(5, end - time.time()))
     log(f"  [wait] {label} done ({total // 60}m{total % 60}s)")
 
 def get_tx_hash(page):
@@ -183,31 +203,37 @@ def get_points(page):
 # WALLET
 # ═══════════════════════════════════════════
 def check_wallet_status(page):
-    if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
-        return 'needs_connect'
     try:
-        body = page.inner_text('body')
-    except Exception:
-        return 'needs_connect'
-    if re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body) or re.search(r'\b0x[a-fA-F0-9]{40}\b', body):
-        return 'connected'
-    for label in ['Stake DOHM', 'Unstake DOHM']:
-        if page.locator(f'button:has-text("{label}"):not([disabled]):visible').count() > 0:
+        if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
+            return 'needs_connect'
+        try:
+            body = page.inner_text('body')
+        except Exception:
+            return 'needs_connect'
+        if re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body) or re.search(r'\b0x[a-fA-F0-9]{40}\b', body):
             return 'connected'
-    if page.locator('input[type="password"]').count() > 0:
-        return 'needs_unlock'
+        for label in ['Stake DOHM', 'Unstake DOHM']:
+            if page.locator(f'button:has-text("{label}"):not([disabled]):visible').count() > 0:
+                return 'connected'
+        if page.locator('input[type="password"]').count() > 0:
+            return 'needs_unlock'
+    except Exception:
+        pass
     return 'needs_connect'
 
 def unlock_wallet(page):
-    pw = page.locator('input[type="password"]')
-    if pw.count() > 0:
-        log("  [wallet] unlocking...")
-        pw.fill(WALLET_PASSWORD)
-        time.sleep(1)
-        u = page.locator('button:has-text("Unlock"):visible')
-        if u.count() > 0:
-            u.first.click()
-            time.sleep(4)
+    try:
+        pw = page.locator('input[type="password"]')
+        if pw.count() > 0:
+            log("  [wallet] unlocking...")
+            pw.fill(WALLET_PASSWORD)
+            time.sleep(1)
+            u = page.locator('button:has-text("Unlock"):visible')
+            if u.count() > 0:
+                u.first.click()
+                time.sleep(4)
+    except Exception as e:
+        log(f"  [wallet] unlock err: {e}")
 
 def restore_wallet(page):
     log("  [wallet] clicking Connect wallet...")
@@ -287,6 +313,8 @@ def click_confirm_sign(page, timeout=30):
 
 def retry_action(fn, tries=3, base_delay=5, label=""):
     for i in range(tries):
+        if state['stop']:
+            return 'stopped'
         try:
             r = fn()
             if r not in ('failed-3x', 'no-confirm', None):
@@ -299,9 +327,88 @@ def retry_action(fn, tries=3, base_delay=5, label=""):
     return 'failed-3x'
 
 # ═══════════════════════════════════════════
+# WAIT UNTIL PENDING GONE
+# ═══════════════════════════════════════════
+def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
+    """
+    Tunggu sampai tulisan 'PENDING / in mempool' HILANG.
+    Polling tiap poll_interval detik.
+    Return: 'confirmed' | 'timeout'
+    """
+    if max_wait is None:
+        max_wait = TX_WAIT_MAX
+    if poll_interval is None:
+        poll_interval = TX_POLL_INTERVAL
+
+    start = time.time()
+    last_log = 0
+    pending_seen = False
+    settled_count = 0
+
+    log(f"  [confirm] {action_label} wait until pending gone (max {max_wait}s)")
+
+    while time.time() - start < max_wait:
+        elapsed = time.time() - start
+        try:
+            body = page.inner_text('body') or ''
+        except Exception:
+            body = ''
+
+        is_pending = bool(re.search(
+            r'(pending|in\s*mempool|mempool|waiting\s+for\s+confirmation|'
+            r'submitting|processing|broadcasting|queued)',
+            body, re.IGNORECASE))
+        is_success = bool(re.search(
+            r'\b(success|confirmed|complete[d]?|settled|done|finalized)\b',
+            body, re.IGNORECASE))
+
+        btn_enabled = False
+        try:
+            for lbl in ('Stake DOHM', 'Unstake DOHM', 'Claim'):
+                btn = page.locator(f'button:has-text("{lbl}"):visible')
+                if btn.count() > 0:
+                    if btn.first.get_attribute('disabled', timeout=500) is None:
+                        btn_enabled = True
+                        break
+        except Exception:
+            pass
+
+        if is_pending:
+            pending_seen = True
+            settled_count = 0
+            if time.time() - last_log > 20:
+                m = re.search(r'pending[^\n]{0,80}', body, re.IGNORECASE)
+                snippet = m.group(0).strip() if m else 'pending...'
+                log(f"  [confirm] {action_label} MASIH PENDING ({elapsed:.0f}s): {snippet[:70]}")
+                last_log = time.time()
+        else:
+            if pending_seen:
+                settled_count += 1
+                if settled_count >= 2:
+                    log(f"  [confirm] {action_label} ✅ PENDING HILANG ({elapsed:.1f}s)")
+                    return 'confirmed'
+            else:
+                if elapsed < 5:
+                    pass
+                elif is_success or btn_enabled:
+                    settled_count += 1
+                    if settled_count >= 2:
+                        log(f"  [confirm] {action_label} ✅ settled tanpa pending ({elapsed:.1f}s)")
+                        return 'confirmed'
+                else:
+                    if time.time() - last_log > 20:
+                        log(f"  [confirm] {action_label} status unclear ({elapsed:.0f}s)")
+                        last_log = time.time()
+
+        time.sleep(poll_interval)
+
+    log(f"  [confirm] {action_label} ⚠️ TIMEOUT {max_wait}s, lanjut aja")
+    return 'timeout'
+
+# ═══════════════════════════════════════════
 # ACTIONS
 # ═══════════════════════════════════════════
-def stake(page, amount=0.2):
+def do_stake(page, amount=0.2):
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     for _ in range(6):
         time.sleep(3)
@@ -326,8 +433,12 @@ def stake(page, amount=0.2):
             s.first.click()
             time.sleep(2)
             conf = click_confirm_sign(page)
-            log(f"  stake tx: {get_tx_hash(page)} | confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+            log(f"  stake confirm: {conf}")
+            if conf == 'confirmed':
+                wait_tx_confirm(page, "stake")
+                log("  stake settled")
+                return 'done'
+            return conf
         time.sleep(2)
     return 'failed-3x'
 
@@ -342,7 +453,7 @@ def get_sohm_balance(page):
         pass
     return 0
 
-def unstake(page, amount=0.1):
+def do_unstake(page, amount=0.1):
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     for _ in range(6):
         time.sleep(3)
@@ -381,12 +492,16 @@ def unstake(page, amount=0.1):
             s.first.click()
             time.sleep(2)
             conf = click_confirm_sign(page)
-            log(f"  unstake tx: {get_tx_hash(page)} | confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+            log(f"  unstake confirm: {conf}")
+            if conf == 'confirmed':
+                wait_tx_confirm(page, "unstake")
+                log("  unstake settled")
+                return 'done'
+            return conf
         time.sleep(3)
     return 'failed-3x'
 
-def claim_matured_bonds(page):
+def do_claim(page):
     page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
     for _ in range(20):
         time.sleep(1)
@@ -408,7 +523,8 @@ def claim_matured_bonds(page):
                 b.scroll_into_view_if_needed()
                 b.click()
                 total += 1
-                time.sleep(8)
+                log(f"  [claim] bond #{total} clicked, tunggu settle...")
+                wait_tx_confirm(page, f"claim-{total}", max_wait=300)
             except Exception as e:
                 log(f"  [claim] err: {e}")
                 break
@@ -421,7 +537,7 @@ def claim_matured_bonds(page):
     return 'done' if total > 0 else 'skip'
 
 # ═══════════════════════════════════════════
-# FAUCET (Link -> wallet Linked -> Continue -> Get BTC -> Get frBTC)
+# FAUCET
 # ═══════════════════════════════════════════
 def _safe_click(page, locator, label="", timeout=5000):
     try:
@@ -443,13 +559,9 @@ def _find_visible(page, selectors):
     for sel in selectors:
         try:
             loc = page.locator(sel)
-            n = loc.count()
-            for i in range(n):
-                try:
-                    if loc.nth(i).is_visible():
-                        return loc.nth(i)
-                except Exception:
-                    continue
+            for i in range(loc.count()):
+                if loc.nth(i).is_visible():
+                    return loc.nth(i)
         except Exception:
             continue
     return None
@@ -470,10 +582,8 @@ def try_claim_faucet(page):
 
         # STEP 1: menu Link
         link_menu = _find_visible(page, [
-            'a:has-text("Link")',
-            'button:has-text("Link")',
-            '[role="tab"]:has-text("Link")',
-            'text=/^Link$/i',
+            'a:has-text("Link")', 'button:has-text("Link")',
+            '[role="tab"]:has-text("Link")', 'text=/^Link$/i',
         ])
         if not link_menu:
             log("[FAUCET] menu 'Link' ga ketemu")
@@ -489,12 +599,8 @@ def try_claim_faucet(page):
 
         # STEP 2: wallet Linked
         wl = _find_visible(page, [
-            'button:has-text("wallet Linked")',
-            'button:has-text("Wallet Linked")',
-            'button:has-text("Linked")',
-            '[role="button"]:has-text("Linked")',
-            'text=/wallet\\s+Linked/i',
-            'text=/Linked/i',
+            'button:has-text("wallet Linked")', 'button:has-text("Wallet Linked")',
+            'button:has-text("Linked")', 'text=/wallet\\s+Linked/i', 'text=/Linked/i',
         ])
         if wl:
             log("[FAUCET] klik 'wallet Linked'")
@@ -509,9 +615,7 @@ def try_claim_faucet(page):
 
         # STEP 3: Continue
         cont = _find_visible(page, [
-            'button:has-text("Continue")',
-            'button:has-text("CONTINUE")',
-            '[role="button"]:has-text("Continue")',
+            'button:has-text("Continue")', 'button:has-text("CONTINUE")',
         ])
         if cont:
             log("[FAUCET] klik Continue")
@@ -529,10 +633,7 @@ def try_claim_faucet(page):
 
         # STEP 4: Get BTC
         btc_btn = _find_visible(page, [
-            'button:has-text("Get BTC")',
-            'button:has-text("GET BTC")',
-            'button:has-text("Get btc")',
-            '[role="button"]:has-text("Get BTC")',
+            'button:has-text("Get BTC")', 'button:has-text("GET BTC")',
             'text=/Get\\s+BTC/i',
         ])
         if btc_btn:
@@ -550,12 +651,8 @@ def try_claim_faucet(page):
 
         # STEP 5: Get frBTC
         frbtc_btn = _find_visible(page, [
-            'button:has-text("Get frBTC")',
-            'button:has-text("GET frBTC")',
-            'button:has-text("Get frbtc")',
-            'button:has-text("frBTC")',
-            '[role="button"]:has-text("frBTC")',
-            'text=/Get\\s+frBTC/i',
+            'button:has-text("Get frBTC")', 'button:has-text("GET frBTC")',
+            'button:has-text("frBTC")', 'text=/Get\\s+frBTC/i',
         ])
         if frbtc_btn:
             log("[FAUCET] klik Get frBTC")
@@ -593,29 +690,32 @@ def try_claim_faucet(page):
 # CYCLE RUNNER
 # ═══════════════════════════════════════════
 def run_farming_session():
-    log(f"[INIT] DOHM Farm v13 | {datetime.now()}")
+    log(f"[INIT] DOHM Farm v16 | {datetime.now()}")
     log(f"[INIT] Target: {POINTS_TARGET} pts | Notif tiap +{NOTIFY_EVERY_PTS} pts")
-    log(f"[INIT] Flow: Stake {STAKE_AMOUNT} -> Wait -> Unstake {UNSTAKE_AMOUNT} -> Wait -> Claim -> Wait -> Repeat")
+    log(f"[INIT] TX_WAIT_MAX={TX_WAIT_MAX}s | TX_POLL={TX_POLL_INTERVAL}s")
     if FAUCET_ENABLED:
         log(f"[INIT] Faucet: ON (cek tiap {FAUCET_MIN_HOURS}-{FAUCET_MAX_HOURS} jam)")
-    notify(f"🚀 <b>DOHM Farm v13 start</b>\nTarget: {POINTS_TARGET} pts\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
+    notify(f"🚀 <b>DOHM Farm v16 start</b>\nTarget: {POINTS_TARGET} pts\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
 
     with Camoufox(headless=True) as browser:
-        page = browser.new_page()
-        page.goto(URL_STAKE, wait_until='load', timeout=30000)
-        time.sleep(5)
-        ensure_wallet(page)
+        page_main = browser.new_page()
+        page_claim = browser.new_page()
 
-        initial_points = get_points(page)
+        page_main.goto(URL_STAKE, wait_until='load', timeout=30000)
+        time.sleep(5)
+        ensure_wallet(page_main)
+
+        initial_points = get_points(page_main)
+        state['initial_points'] = initial_points
+        state['last_notify_pts'] = initial_points
         log(f"[INIT] Points: {initial_points:.2f} | Target: {POINTS_TARGET}")
         notify(f"📊 <b>Starting points:</b> {initial_points:.2f}")
 
         cycle_start = time.time()
         cycle_num = 0
-        last_notif_pts = initial_points
-        next_faucet_time = time.time()  # cek faucet segera di cycle pertama
+        next_faucet_time = time.time()
 
-        while True:
+        while not state['stop']:
             cycle_num += 1
             if MAX_CYCLES > 0 and cycle_num > MAX_CYCLES:
                 log(f"[END] Max cycles ({MAX_CYCLES}) reached.")
@@ -626,7 +726,7 @@ def run_farming_session():
                 f"{datetime.now().strftime('%H:%M:%S')}")
             log(f"{'=' * 60}")
 
-            pts = get_points(page)
+            pts = get_points(page_main)
             heartbeat(f"cycle={cycle_num} pts={pts:.2f}")
 
             # ── CEK TARGET ──
@@ -642,79 +742,69 @@ def run_farming_session():
                 return True
 
             # ── NOTIF TIAP N PTS ──
-            if pts - last_notif_pts >= NOTIFY_EVERY_PTS:
-                gained = pts - initial_points
+            if pts - state['last_notify_pts'] >= NOTIFY_EVERY_PTS:
+                gained = pts - state['initial_points']
                 notify(f"📈 <b>{pts:.2f} pts</b> (+{gained:.2f} total)\nCycle: {cycle_num}")
-                last_notif_pts = pts
+                state['last_notify_pts'] = pts
 
             log(f"  pts: {pts:.2f}")
 
-            # ── AUTO UPDATE CHECK ──
-            if AUTO_UPDATE and cycle_num % UPDATE_CHECK_EVERY_CYCLE == 0:
+            # ── AUTO UPDATE ──
+            if AUTO_UPDATE and cycle_num % 5 == 0:
                 check_and_update()
 
-            # ── FAUCET CHECK ──
+            # ── FAUCET ──
             if FAUCET_ENABLED and time.time() >= next_faucet_time:
                 log("  [faucet] checking...")
-                faucet_result = retry_action(lambda: try_claim_faucet(page), tries=2, label="faucet")
+                faucet_result = retry_action(lambda: try_claim_faucet(page_main), tries=2, label="faucet")
                 log(f"  [faucet] result: {faucet_result}")
                 if faucet_result in ('claimed', 'cooldown'):
-                    # Cooldown atau sukses → jadwalkan berikutnya
                     delay_hours = random.uniform(FAUCET_MIN_HOURS, FAUCET_MAX_HOURS)
                     next_faucet_time = time.time() + delay_hours * 3600
                     log(f"  [faucet] next check in {delay_hours:.1f}h")
                 elif faucet_result == 'not-available':
-                    # Faucet belum available, cek lagi dalam 1 jam
                     next_faucet_time = time.time() + 3600
-                    log("  [faucet] not available, retry in 1h")
                 else:
-                    # Error → cek lagi dalam 30 menit
                     next_faucet_time = time.time() + 1800
-                    log("  [faucet] error, retry in 30m")
-                # Navigate back to stake page after faucet
-                page.goto(URL_STAKE, wait_until='load', timeout=30000)
+                page_main.goto(URL_STAKE, wait_until='load', timeout=30000)
                 time.sleep(3)
 
             # ── STAKE ──
             log(f"  [1/3] Stake {STAKE_AMOUNT} DOHM...")
-            r1 = retry_action(lambda: stake(page, STAKE_AMOUNT), tries=3, label="stake")
+            r1 = retry_action(lambda: do_stake(page_main, STAKE_AMOUNT), tries=3, label="stake")
             log(f"  -> {r1}")
             if r1 != 'done':
                 log(f"  [!] stake gagal ({r1}), skip cycle")
                 notify(f"⚠️ Stake gagal di cycle {cycle_num}: {r1}")
+                state['consecutive_fails'] += 1
                 time.sleep(60)
                 continue
 
-            sleep_minutes(WAIT_MINUTES, "setelah stake")
-
             # ── UNSTAKE ──
             log(f"  [2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
-            r2 = retry_action(lambda: unstake(page, UNSTAKE_AMOUNT), tries=3, label="unstake")
+            r2 = retry_action(lambda: do_unstake(page_main, UNSTAKE_AMOUNT), tries=3, label="unstake")
             log(f"  -> {r2}")
-            if r2 == 'done':
-                sleep_minutes(WAIT_MINUTES, "setelah unstake")
-            elif r2 == 'skip':
-                log("  no sDOHM, lanjut ke claim")
 
             # ── CLAIM ──
             log(f"  [3/3] Claim matured bonds...")
-            r3 = retry_action(lambda: claim_matured_bonds(page), tries=2, label="claim")
+            r3 = retry_action(lambda: do_claim(page_claim), tries=2, label="claim")
             log(f"  -> {r3}")
-            sleep_minutes(WAIT_MINUTES, "setelah claim")
 
-            # ── CYCLE DONE ──
+            # ── WAJIB WAIT ──
+            sleep_jitter(WAIT_MINUTES, "setelah cycle")
+
+            state['consecutive_fails'] = 0
             elapsed = (time.time() - cycle_start) / 3600
-            pts_now = get_points(page)
-            gained = pts_now - initial_points
+            pts_now = get_points(page_main)
+            gained = pts_now - state['initial_points']
             log(f"  cycle {cycle_num} done. pts={pts_now:.2f} | elapsed={elapsed:.2f}h | gained={gained:.2f}")
 
-            # Notif tiap +N pts
-            if pts_now - last_notif_pts >= NOTIFY_EVERY_PTS:
+            if pts_now - state['last_notify_pts'] >= NOTIFY_EVERY_PTS:
                 notify(f"📈 <b>{pts_now:.2f} pts</b> (+{gained:.2f} total)\nCycle: {cycle_num}")
-                last_notif_pts = pts_now
+                state['last_notify_pts'] = pts_now
 
 # ═══════════════════════════════════════════
-# SUPERVISOR — ⚠️ TERPOTONG
+# SUPERVISOR
 # ═══════════════════════════════════════════
 if __name__ == '__main__':
     lock = acquire_lock()
