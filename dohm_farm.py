@@ -46,8 +46,8 @@ TX_POLL_INTERVAL = int(os.environ.get('TX_POLL_INTERVAL', '5'))
 GRACE_MIN = int(os.environ.get('GRACE_MIN', '10'))
 GRACE_MAX = int(os.environ.get('GRACE_MAX', '20'))
 
-CLAIM_MIN_WAIT = int(os.environ.get('CLAIM_MIN_WAIT', '60'))
-CLAIM_MAX_WAIT = int(os.environ.get('CLAIM_MAX_WAIT', '600'))
+CLAIM_MIN_WAIT = int(os.environ.get('CLAIM_MIN_WAIT', '30'))
+CLAIM_MAX_WAIT = int(os.environ.get('CLAIM_MAX_WAIT', '60'))
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
