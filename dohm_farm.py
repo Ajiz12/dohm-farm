@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-DOHM Farming v20 - SEQUENTIAL (no thread)
-Flow per cycle:
-  stake 0.2 -> jeda 5-15s -> unstake 0.1 -> jeda 5-15s
-  -> claim (same thread) -> next cycle
-
-Camoufox/playwright CANNOT be used from multiple threads.
-All ops sequential in MainThread. Health check via file-based heartbeat.
-Auto-restart via supervisor. Hourly Telegram report.
+DOHM Farming v20.1 - SEQUENTIAL + PERSISTENT PROFILE
+Fix:
+- No threads (Playwright sync API thread-unsafe)
+- Persistent user_data_dir (wallet ga ilang tiap restart)
+- Wallet create fallback + log seed
+- Hourly Telegram report
 """
 import os
 import sys
@@ -17,6 +15,7 @@ import random
 import fcntl
 import hashlib
 import traceback
+import threading
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -28,8 +27,8 @@ from camoufox.sync_api import Camoufox
 # ═══════════════════════════════════════════
 WALLET_PASSWORD = os.environ.get('WALLET_PASSWORD')
 SEED_PHRASE     = os.environ.get('SEED_PHRASE')
-if not WALLET_PASSWORD or not SEED_PHRASE:
-    print("[FATAL] WALLET_PASSWORD & SEED_PHRASE wajib di-set.")
+if not WALLET_PASSWORD:
+    print("[FATAL] WALLET_PASSWORD wajib di-set.")
     sys.exit(1)
 
 POINTS_TARGET = float(os.environ.get('POINTS_TARGET', '25000'))
@@ -42,11 +41,9 @@ JEDA_MAX = int(os.environ.get('JEDA_MAX', '15'))
 
 TX_WAIT_MAX      = int(os.environ.get('TX_WAIT_MAX', '900'))
 TX_POLL_INTERVAL = int(os.environ.get('TX_POLL_INTERVAL', '5'))
-
 GRACE_MIN = int(os.environ.get('GRACE_MIN', '10'))
 GRACE_MAX = int(os.environ.get('GRACE_MAX', '20'))
-
-CLAIM_MAX_WAIT = int(os.environ.get('CLAIM_MAX_WAIT', '300'))
+CLAIM_MAX_WAIT = int(os.environ.get('CLAIM_MAX_WAIT', '600'))
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -56,8 +53,10 @@ FAUCET_ENABLED   = int(os.environ.get('FAUCET_ENABLED', '1'))
 FAUCET_MIN_HOURS = float(os.environ.get('FAUCET_MIN_HOURS', '6'))
 FAUCET_MAX_HOURS = float(os.environ.get('FAUCET_MAX_HOURS', '12'))
 
-AUTO_UPDATE = int(os.environ.get('AUTO_UPDATE', '0'))
-UPDATE_URL  = os.environ.get('UPDATE_URL', '')
+# Persistent profile
+PROFILE_DIR = os.environ.get('PROFILE_DIR', '/tmp/dohm_profile')
+# wallet mode: 'auto' | 'restore' | 'create'
+WALLET_MODE = os.environ.get('WALLET_MODE', 'auto')
 
 URL_STAKE     = 'https://testnet.dohm.finance/app/stake'
 URL_PORTFOLIO = 'https://testnet.dohm.finance/app/portfolio'
@@ -65,30 +64,31 @@ URL_SETUP     = 'https://testnet.dohm.finance/app/setup'
 LOCK_FILE     = '/tmp/dohm_farm.lock'
 LOG_FILE      = '/tmp/dohm_farm.log'
 HEARTBEAT_FILE= '/tmp/dohm_farm.heartbeat'
-SCRIPT_PATH   = os.path.abspath(__file__)
 
 # ═══════════════════════════════════════════
-# GLOBAL STATE
+# STATE
 # ═══════════════════════════════════════════
 state = {
     'stop': False,
     'initial_points': 0.0,
     'last_notify_pts': 0.0,
-    'last_hourly_pts': 0.0,
     'last_hourly_time': 0.0,
+    'target_reached': False,
+    'wallet_ok': False,
     'claim_count': 0,
+    'current_cycle': 0,
 }
+
 start_time = time.time()
-_last_heartbeat = 0
 
 # ═══════════════════════════════════════════
 # LOG + NOTIF
 # ═══════════════════════════════════════════
-_log_lock = __import__('threading').Lock()
+_log_lock = threading.Lock()
 
 def log(msg):
     ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    line = f"[{ts}] [MAIN] {msg}"
+    line = f"[{ts}] {msg}"
     with _log_lock:
         print(line, flush=True)
         try:
@@ -114,55 +114,11 @@ def notify(msg):
         log(f"[NOTIF] gagal: {e}")
 
 def heartbeat(payload: str):
-    global _last_heartbeat
-    now = time.time()
-    if now - _last_heartbeat < 10:
-        return
-    _last_heartbeat = now
     try:
         with open(HEARTBEAT_FILE, 'w') as f:
             f.write(f"{datetime.now().isoformat()} | {payload}\n")
     except Exception:
         pass
-
-# ═══════════════════════════════════════════
-# AUTO UPDATE
-# ═══════════════════════════════════════════
-def check_and_update():
-    if not AUTO_UPDATE or not UPDATE_URL:
-        return False
-    try:
-        log(f"[UPDATE] cek {UPDATE_URL}")
-        req = urllib.request.Request(UPDATE_URL, headers={'User-Agent': 'dohm-farm'})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            remote = r.read()
-        local = open(SCRIPT_PATH, 'rb').read()
-        if hashlib.sha256(remote).hexdigest() == hashlib.sha256(local).hexdigest():
-            log("[UPDATE] sudah terbaru")
-            return False
-        with open(SCRIPT_PATH + '.bak', 'wb') as f:
-            f.write(local)
-        with open(SCRIPT_PATH, 'wb') as f:
-            f.write(remote)
-        os.chmod(SCRIPT_PATH, 0o755)
-        notify("🔄 <b>Auto-update</b> — restart otomatis...")
-        time.sleep(2)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-    except Exception as e:
-        log(f"[UPDATE] error: {e}")
-    return False
-
-# ═══════════════════════════════════════════
-# LOCK
-# ═══════════════════════════════════════════
-def acquire_lock():
-    f = open(LOCK_FILE, 'w')
-    try:
-        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return f
-    except BlockingIOError:
-        log("[LOCK] Script lain masih jalan.")
-        return None
 
 # ═══════════════════════════════════════════
 # HELPERS
@@ -217,19 +173,127 @@ def check_wallet_status(page):
         if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
             return 'needs_connect'
         try:
-            body = page.inner_text('body')
+            body = page.inner_text('body') or ''
         except Exception:
             return 'needs_connect'
         if re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body) or re.search(r'\b0x[a-fA-F0-9]{40}\b', body):
             return 'connected'
-        for label in ['Stake DOHM', 'Unstake DOHM']:
-            if page.locator(f'button:has-text("{label}"):not([disabled]):visible').count() > 0:
+        for label in ['Stake DOHM', 'Unstake DOHM', 'Get BTC']:
+            if page.locator(f'button:has-text("{label}"):visible').count() > 0:
                 return 'connected'
         if page.locator('input[type="password"]').count() > 0:
             return 'needs_unlock'
+        if page.locator('text=/Create.*testnet.*wallet/i').count() > 0:
+            return 'needs_create'
     except Exception:
         pass
     return 'needs_connect'
+
+def create_wallet(page):
+    log("  [wallet] mencoba CREATE wallet baru...")
+    try:
+        for sel in [
+            'button:has-text("Create wallet")',
+            'button:has-text("Create testnet wallet")',
+            'button:has-text("Get started")',
+            'button:has-text("Create")',
+            'text=/Create.*wallet/i',
+        ]:
+            btn = page.locator(sel)
+            if btn.count() > 0 and btn.first.is_visible():
+                log(f"  [wallet] klik '{sel}'")
+                btn.first.scroll_into_view_if_needed()
+                btn.first.click()
+                time.sleep(5)
+                break
+
+        try:
+            body = page.inner_text('body') or ''
+            m = re.search(r'((?:[a-z]+\s+){11}[a-z]+)', body)
+            if m:
+                seed = m.group(1).strip()
+                log(f"  [wallet] !!! SEED GENERATED: {seed}")
+                log(f"  [wallet] SIMPAN INI KE .env SEBAGAI SEED_PHRASE")
+        except Exception:
+            pass
+
+        pw = page.locator('input[type="password"]')
+        if pw.count() > 0:
+            pw.first.fill(WALLET_PASSWORD)
+            time.sleep(0.5)
+
+        for sel in [
+            'button:has-text("Create")',
+            'button:has-text("Confirm")',
+            'button:has-text("Continue")',
+        ]:
+            btn = page.locator(sel)
+            if btn.count() > 0 and btn.first.is_visible():
+                btn.first.click()
+                time.sleep(5)
+                break
+
+        time.sleep(3)
+        status = check_wallet_status(page)
+        log(f"  [wallet] create result: {status}")
+        return status == 'connected'
+    except Exception as e:
+        log(f"  [wallet] create err: {e}")
+        return False
+
+def restore_wallet(page):
+    if not SEED_PHRASE:
+        log("  [wallet] SEED_PHRASE kosong, skip restore")
+        return False
+
+    log("  [wallet] mencoba RESTORE dari seed...")
+    try:
+        connect = page.locator('button:has-text("Connect wallet"):visible')
+        if connect.count() > 0:
+            connect.first.click()
+            time.sleep(2)
+
+        # Tunggu modal muncul
+        for _ in range(10):
+            time.sleep(1)
+            restore = page.locator('button:has-text("Restore from recovery phrase"):visible')
+            if restore.count() > 0:
+                break
+
+        restore = page.locator('button:has-text("Restore from recovery phrase"):visible')
+        if restore.count() == 0:
+            log("  [wallet] tombol 'Restore from recovery phrase' ga ketemu")
+            return False
+        restore.first.click()
+        time.sleep(3)
+
+        ta = page.locator('textarea')
+        if ta.count() > 0:
+            ta.fill(SEED_PHRASE)
+            time.sleep(1)
+            log("  [wallet] seed phrase filled")
+
+        pw = page.locator('input[type="password"]')
+        if pw.count() > 0:
+            pw.fill(WALLET_PASSWORD)
+            time.sleep(1)
+            log("  [wallet] password filled")
+
+        rb = page.locator('button:has-text("Restore"):visible')
+        if rb.count() > 0:
+            rb.first.click()
+            log("  [wallet] klik Restore...")
+            time.sleep(15)
+
+        page.goto(URL_STAKE, wait_until='load', timeout=30000)
+        time.sleep(10)
+
+        status = check_wallet_status(page)
+        log(f"  [wallet] restore result: {status}")
+        return status == 'connected'
+    except Exception as e:
+        log(f"  [wallet] restore err: {e}")
+        return False
 
 def unlock_wallet(page):
     try:
@@ -238,80 +302,40 @@ def unlock_wallet(page):
             log("  [wallet] unlocking...")
             pw.fill(WALLET_PASSWORD)
             time.sleep(1)
-            u = page.locator('button:has-text("Unlock"):visible')
-            if u.count() > 0:
-                u.first.click()
-                time.sleep(4)
+            unlock = page.locator('button:has-text("Unlock"):visible')
+            if unlock.count() > 0:
+                unlock.first.click()
+                time.sleep(5)
+                log("  [wallet] unlocked")
+                return True
     except Exception as e:
         log(f"  [wallet] unlock err: {e}")
-
-def restore_wallet(page):
-    log("  [wallet] clicking Connect wallet...")
-    try:
-        page.locator('button:has-text("Connect wallet"):visible').first.click()
-    except Exception:
-        return False
-
-    # Tunggu modal muncul (max 10s)
-    log("  [wallet] tunggu modal...")
-    for _ in range(10):
-        time.sleep(1)
-        r = page.locator('button:has-text("Restore from recovery phrase"):visible')
-        if r.count() > 0:
-            break
-
-    r = page.locator('button:has-text("Restore from recovery phrase"):visible')
-    if r.count() == 0:
-        # Coba alternatif selector
-        r2 = page.locator('text=/restore.*recovery/i')
-        if r2.count() == 0:
-            log("  [wallet] 'Restore from recovery phrase' ga ketemu")
-            return False
-        r = r2
-
-    log("  [wallet] klik 'Restore from recovery phrase'")
-    r.first.click()
-    time.sleep(3)
-
-    # Fill seed phrase
-    ta = page.locator('textarea')
-    if ta.count() > 0:
-        log("  [wallet] filling seed phrase...")
-        ta.fill(SEED_PHRASE)
-        time.sleep(1)
-
-    # Fill password
-    pw = page.locator('input[type="password"]')
-    if pw.count() > 0:
-        log("  [wallet] filling password...")
-        pw.fill(WALLET_PASSWORD)
-        time.sleep(1)
-
-    # Click Restore
-    rb = page.locator('button:has-text("Restore"):visible')
-    if rb.count() > 0:
-        log("  [wallet] klik 'Restore'...")
-        rb.first.click()
-        time.sleep(12)
-
-    page.goto(URL_STAKE, wait_until='load', timeout=30000)
-    time.sleep(8)
-    result = check_wallet_status(page)
-    log(f"  [wallet] restore result: {result}")
-    return result == 'connected'
+    return False
 
 def ensure_wallet(page):
-    s = check_wallet_status(page)
-    log(f"  [wallet] status: {s}")
-    if s == 'connected':
+    status = check_wallet_status(page)
+    log(f"  [wallet] status: {status}")
+
+    if status == 'connected':
         return True
-    if s == 'needs_unlock':
+
+    if status == 'needs_unlock':
         unlock_wallet(page)
-        return check_wallet_status(page) == 'connected'
-    if restore_wallet(page):
-        return True
-    unlock_wallet(page)
-    return check_wallet_status(page) == 'connected'
+        status = check_wallet_status(page)
+        if status == 'connected':
+            return True
+
+    if WALLET_MODE == 'restore':
+        return restore_wallet(page)
+    elif WALLET_MODE == 'create':
+        return create_wallet(page)
+    else:  # auto
+        if restore_wallet(page):
+            return True
+        log("  [wallet] restore gagal, coba create...")
+        if create_wallet(page):
+            return True
+        return False
 
 # ═══════════════════════════════════════════
 # FORM + RETRY
@@ -364,7 +388,7 @@ def retry_action(fn, tries=3, base_delay=5, label=""):
     return 'failed-3x'
 
 # ═══════════════════════════════════════════
-# WAIT TX CONFIRM (3-TAHAP)
+# WAIT TX (3-TAHAP)
 # ═══════════════════════════════════════════
 def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
     if max_wait is None:
@@ -374,13 +398,13 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
 
     start = time.time()
     last_log = 0
-
-    log(f"  [confirm] {action_label} tahap 1: tunggu PENDING muncul")
     pending_seen = False
+    settled_count = 0
+    pending_gone = False
+
+    log(f"  [confirm] {action_label} tunggu PENDING muncul...")
     t1_start = time.time()
     while time.time() - t1_start < 30:
-        if state['stop']:
-            return 'timeout'
         try:
             body = page.inner_text('body') or ''
         except Exception:
@@ -388,21 +412,12 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
         if re.search(r'(pending|in\s*mempool|mempool|submitting|processing|broadcasting)',
                      body, re.IGNORECASE):
             pending_seen = True
-            m = re.search(r'pending[^\n]{0,80}', body, re.IGNORECASE)
-            snippet = m.group(0).strip() if m else 'pending...'
-            log(f"  [confirm] {action_label} pending MUNCUL: {snippet[:70]}")
+            log(f"  [confirm] {action_label} pending MUNCUL")
             break
         time.sleep(2)
 
-    if not pending_seen:
-        log(f"  [confirm] {action_label} pending ga muncul, skip ke grace")
-
-    log(f"  [confirm] {action_label} tahap 2: tunggu PENDING hilang")
-    settled_count = 0
-    pending_gone = False
+    log(f"  [confirm] {action_label} tunggu PENDING hilang...")
     while time.time() - start < max_wait:
-        if state['stop']:
-            return 'timeout'
         elapsed = time.time() - start
         try:
             body = page.inner_text('body') or ''
@@ -417,35 +432,29 @@ def wait_tx_confirm(page, action_label="", max_wait=None, poll_interval=None):
         if is_pending:
             settled_count = 0
             if time.time() - last_log > 20:
-                m = re.search(r'pending[^\n]{0,80}', body, re.IGNORECASE)
-                snippet = m.group(0).strip() if m else 'pending...'
-                log(f"  [confirm] {action_label} MASIH PENDING ({elapsed:.0f}s): {snippet[:70]}")
+                log(f"  [confirm] {action_label} MASIH PENDING ({elapsed:.0f}s)")
                 last_log = time.time()
         else:
             if pending_seen:
                 settled_count += 1
                 if settled_count >= 2:
-                    log(f"  [confirm] {action_label} ✅ PENDING HILANG di {elapsed:.1f}s")
+                    log(f"  [confirm] {action_label} ✅ PENDING HILANG ({elapsed:.1f}s)")
                     pending_gone = True
                     break
             else:
                 if elapsed >= 5:
-                    log(f"  [confirm] {action_label} ✅ settled (ga ada pending) di {elapsed:.1f}s")
+                    log(f"  [confirm] {action_label} ✅ settled ({elapsed:.1f}s)")
                     pending_gone = True
                     break
         time.sleep(poll_interval)
 
     if not pending_gone:
-        log(f"  [confirm] {action_label} ⚠️ TIMEOUT {max_wait}s")
+        log(f"  [confirm] {action_label} ⚠️ TIMEOUT")
         return 'timeout'
 
     grace = random.uniform(GRACE_MIN, GRACE_MAX)
-    log(f"  [confirm] {action_label} tahap 3: grace {grace:.0f}s")
-    grace_end = time.time() + grace
-    while time.time() < grace_end and not state['stop']:
-        time.sleep(1)
-
-    log(f"  [confirm] {action_label} ✅ done")
+    log(f"  [confirm] {action_label} grace {grace:.0f}s")
+    time.sleep(grace)
     return 'confirmed'
 
 # ═══════════════════════════════════════════
@@ -488,7 +497,10 @@ def do_stake(page, amount=0.2):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  stake confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+            if conf == 'confirmed':
+                wait_tx_confirm(page, "stake")
+                return 'done'
+            return conf
         time.sleep(2)
     return 'failed-3x'
 
@@ -532,12 +544,14 @@ def do_unstake(page, amount=0.1):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  unstake confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+            if conf == 'confirmed':
+                wait_tx_confirm(page, "unstake")
+                return 'done'
+            return conf
         time.sleep(3)
     return 'failed-3x'
 
 def do_claim(page):
-    """Claim semua matured bonds — SEQUENTIAL (same thread)."""
     page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
     for _ in range(20):
         time.sleep(1)
@@ -559,14 +573,14 @@ def do_claim(page):
                 b.scroll_into_view_if_needed()
                 b.click()
                 total += 1
-                log(f"  [claim] bond #{total} clicked, tunggu settle...")
+                log(f"  [claim] bond #{total} clicked")
                 wait_tx_confirm(page, f"claim-{total}", max_wait=CLAIM_MAX_WAIT)
             except Exception as e:
                 log(f"  [claim] err: {e}")
                 break
         try:
             page.reload(wait_until='load', timeout=30000)
-            time.sleep(5)
+            time.sleep(8)
         except Exception:
             break
     log(f"  [claim] total: {total}")
@@ -718,18 +732,21 @@ def try_claim_faucet(page):
         return 'error'
 
 # ═══════════════════════════════════════════
-# CYCLE RUNNER (SEQUENTIAL — NO THREADS)
+# CYCLE RUNNER (SEQUENTIAL)
 # ═══════════════════════════════════════════
 def run_farming_session():
-    log(f"[INIT] DOHM Farm v20 | {datetime.now()}")
+    log(f"[INIT] DOHM Farm v20.1 | {datetime.now()}")
     log(f"[INIT] Target: {POINTS_TARGET} pts | Notif tiap +{NOTIFY_EVERY_PTS} pts")
     log(f"[INIT] Flow: Stake → {JEDA_MIN}-{JEDA_MAX}s → Unstake → {JEDA_MIN}-{JEDA_MAX}s → Claim → next")
-    log(f"[INIT] Grace: {GRACE_MIN}-{GRACE_MAX}s | TX_WAIT_MAX={TX_WAIT_MAX}s")
+    log(f"[INIT] Profile: {PROFILE_DIR} | Wallet: {WALLET_MODE}")
     if FAUCET_ENABLED:
         log(f"[INIT] Faucet: ON (cek tiap {FAUCET_MIN_HOURS}-{FAUCET_MAX_HOURS} jam)")
-    notify(f"🚀 <b>DOHM Farm v20 start</b>\nTarget: {POINTS_TARGET} pts\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
+    notify(f"🚀 <b>DOHM Farm v20.1 start</b>\nTarget: {POINTS_TARGET} pts\nProfile: persistent\nMode: {'infinite 24/7' if MAX_CYCLES == 0 else f'{MAX_CYCLES} cycles'}")
 
-    with Camoufox(headless=True) as browser:
+    # Persistent profile — wallet ga ilang tiap restart
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+
+    with Camoufox(headless=True, user_data_dir=PROFILE_DIR) as browser:
         page = browser.new_page()
 
         page.goto(URL_STAKE, wait_until='load', timeout=30000)
@@ -739,7 +756,6 @@ def run_farming_session():
         initial_points = get_points(page)
         state['initial_points'] = initial_points
         state['last_notify_pts'] = initial_points
-        state['last_hourly_pts'] = initial_points
         state['last_hourly_time'] = time.time()
         log(f"[INIT] Points: {initial_points:.2f} | Target: {POINTS_TARGET}")
         notify(f"📊 <b>Starting points:</b> {initial_points:.2f}")
@@ -800,14 +816,9 @@ def run_farming_session():
                     f"Elapsed: {elapsed_h:.1f}h\n"
                     f"ETA target: ~{eta_h:.1f}h lagi"
                 )
-                state['last_hourly_pts'] = pts
                 state['last_hourly_time'] = now
 
             log(f"  pts: {pts:.2f}")
-
-            # ── AUTO UPDATE ──
-            if AUTO_UPDATE and cycle_num % 5 == 0:
-                check_and_update()
 
             # ── FAUCET ──
             if FAUCET_ENABLED and time.time() >= next_faucet_time:
@@ -861,8 +872,11 @@ def run_farming_session():
 # SUPERVISOR
 # ═══════════════════════════════════════════
 if __name__ == '__main__':
-    lock = acquire_lock()
-    if not lock:
+    lock_file = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("[LOCK] Script lain masih jalan. Exit.")
         sys.exit(1)
 
     restart_count = 0
