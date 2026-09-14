@@ -762,9 +762,9 @@ def try_claim_faucet(page):
 # ═══════════════════════════════════════════
 # CLAIM THREAD (async)
 # ═══════════════════════════════════════════
-def claim_worker(browser, pages_ref):
-    """CLM thread: tunggu claim_ready, buka page baru, claim, repeat."""
-    log("[CLM] started")
+def claim_worker(page_claim):
+    """CLM thread: tunggu claim_ready, pakai page_claim, claim, repeat."""
+    log("[CLM] started (pageClaim)")
     while not state['stop'] and not state['browser_dead']:
         if not state['claim_ready']:
             time.sleep(2)
@@ -775,21 +775,15 @@ def claim_worker(browser, pages_ref):
         log("[CLM] claim_ready=True, mulai claim...")
 
         try:
-            page = browser.new_page()
-            pages_ref[0]['claim'] = page
-            result = do_claim(page)
+            result = do_claim(page_claim)
             state['claim_count'] += 1
             log(f"[CLM] claim #{state['claim_count']} selesai: {result}")
-            try:
-                page.close()
-            except Exception:
-                pass
-            pages_ref[0].pop('claim', None)
         except Exception as e:
             log(f"[CLM] error: {e}")
             log(traceback.format_exc())
-            state['browser_dead'] = True
-            state['thread_died'] = "CLM"
+            if 'closed' in str(e).lower():
+                state['browser_dead'] = True
+                state['thread_died'] = "CLM"
 
         state['claim_running'] = False
 
@@ -818,9 +812,10 @@ def run_farming_session():
 
     with Camoufox(headless=True) as browser:
         page_main = browser.new_page()
+        page_claim = browser.new_page()
 
         # pages_ref = [dict] — mutable container threads share
-        pages_ref = [{'main': page_main}]
+        pages_ref = [{'main': page_main, 'claim': page_claim}]
 
         page_main.goto(URL_STAKE, wait_until='load', timeout=30000)
         time.sleep(5)
@@ -841,7 +836,7 @@ def run_farming_session():
         hlt_thread.start()
         log("[INIT] HLT thread started")
 
-        clm_thread = threading.Thread(target=thread_wrapper("CLM", claim_worker, browser, pages_ref), name="CLM", daemon=True)
+        clm_thread = threading.Thread(target=thread_wrapper("CLM", claim_worker, page_claim), name="CLM", daemon=True)
         clm_thread.start()
         log("[INIT] CLM thread started")
 
