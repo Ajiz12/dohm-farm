@@ -251,27 +251,54 @@ def restore_wallet(page):
         page.locator('button:has-text("Connect wallet"):visible').first.click()
     except Exception:
         return False
-    time.sleep(2)
+
+    # Tunggu modal muncul (max 10s)
+    log("  [wallet] tunggu modal...")
+    for _ in range(10):
+        time.sleep(1)
+        r = page.locator('button:has-text("Restore from recovery phrase"):visible')
+        if r.count() > 0:
+            break
+
     r = page.locator('button:has-text("Restore from recovery phrase"):visible')
     if r.count() == 0:
-        return False
+        # Coba alternatif selector
+        r2 = page.locator('text=/restore.*recovery/i')
+        if r2.count() == 0:
+            log("  [wallet] 'Restore from recovery phrase' ga ketemu")
+            return False
+        r = r2
+
+    log("  [wallet] klik 'Restore from recovery phrase'")
     r.first.click()
-    time.sleep(2)
+    time.sleep(3)
+
+    # Fill seed phrase
     ta = page.locator('textarea')
     if ta.count() > 0:
+        log("  [wallet] filling seed phrase...")
         ta.fill(SEED_PHRASE)
-        time.sleep(0.5)
+        time.sleep(1)
+
+    # Fill password
     pw = page.locator('input[type="password"]')
     if pw.count() > 0:
+        log("  [wallet] filling password...")
         pw.fill(WALLET_PASSWORD)
-        time.sleep(0.5)
+        time.sleep(1)
+
+    # Click Restore
     rb = page.locator('button:has-text("Restore"):visible')
     if rb.count() > 0:
+        log("  [wallet] klik 'Restore'...")
         rb.first.click()
-        time.sleep(10)
+        time.sleep(12)
+
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     time.sleep(8)
-    return check_wallet_status(page) == 'connected'
+    result = check_wallet_status(page)
+    log(f"  [wallet] restore result: {result}")
+    return result == 'connected'
 
 def ensure_wallet(page):
     s = check_wallet_status(page)
