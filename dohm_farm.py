@@ -746,7 +746,7 @@ def run_farming_session():
     # Persistent profile — wallet ga ilang tiap restart
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
-    with Camoufox(headless=True, persistent_context=True, user_data_dir=PROFILE_DIR) as browser:
+    with Camoufox(headless=True) as browser:
         page = browser.new_page()
 
         page.goto(URL_STAKE, wait_until='load', timeout=30000)
