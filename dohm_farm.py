@@ -502,10 +502,7 @@ def do_stake(page, amount=0.2):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  stake confirm: {conf}")
-            if conf == 'confirmed':
-                wait_tx_confirm(page, "stake")
-                return 'done'
-            return conf
+            return 'done' if conf == 'confirmed' else conf
         time.sleep(2)
     return 'failed-3x'
 
@@ -549,10 +546,7 @@ def do_unstake(page, amount=0.1):
             time.sleep(2)
             conf = click_confirm_sign(page)
             log(f"  unstake confirm: {conf}")
-            if conf == 'confirmed':
-                wait_tx_confirm(page, "unstake")
-                return 'done'
-            return conf
+            return 'done' if conf == 'confirmed' else conf
         time.sleep(3)
     return 'failed-3x'
 
