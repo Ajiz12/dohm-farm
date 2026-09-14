@@ -176,8 +176,13 @@ def check_wallet_status(page):
             body = page.inner_text('body') or ''
         except Exception:
             return 'needs_connect'
+        # Full address: bcrt1q... or 0x...
         if re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body) or re.search(r'\b0x[a-fA-F0-9]{40}\b', body):
             return 'connected'
+        # Truncated address: bcrt…25pu (DOHM UI shows this)
+        if re.search(r'bcrt[\u2026\.][a-z0-9]{2,}', body):
+            return 'connected'
+        # Stake/Unstake buttons visible = wallet connected
         for label in ['Stake DOHM', 'Unstake DOHM', 'Get BTC']:
             if page.locator(f'button:has-text("{label}"):visible').count() > 0:
                 return 'connected'
