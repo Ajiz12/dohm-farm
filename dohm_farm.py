@@ -84,6 +84,8 @@ state = {
     'claim_running': False,
     'claim_count': 0,
     'current_cycle': 0,
+    'last_hourly_pts': 0.0,
+    'last_hourly_time': 0.0,
 }
 
 start_time = time.time()
@@ -880,6 +882,26 @@ def run_farming_session():
                 gained = pts - state['initial_points']
                 notify(f"📈 <b>{pts:.2f} pts</b> (+{gained:.2f} total)\nCycle: {cycle_num} | Claims: {state['claim_count']}")
                 state['last_notify_pts'] = pts
+
+            # ── NOTIF PERJAM ──
+            now = time.time()
+            if now - state['last_hourly_time'] >= 3600:
+                elapsed_h = (now - start_time) / 3600
+                gained = pts - state['initial_points']
+                rate = gained / elapsed_h if elapsed_h > 0 else 0
+                remaining = POINTS_TARGET - pts
+                eta_h = remaining / rate if rate > 0 else 0
+                notify(
+                    f"⏰ <b>HOURLY REPORT</b>\n"
+                    f"Points: <b>{pts:.2f}</b> / {POINTS_TARGET}\n"
+                    f"Gained: +{gained:.2f} pts\n"
+                    f"Rate: {rate:.2f} pts/jam\n"
+                    f"Cycles: {cycle_num} | Claims: {state['claim_count']}\n"
+                    f"Elapsed: {elapsed_h:.1f}h\n"
+                    f"ETA target: ~{eta_h:.1f}h lagi"
+                )
+                state['last_hourly_pts'] = pts
+                state['last_hourly_time'] = now
 
             log(f"  pts: {pts:.2f}")
 
