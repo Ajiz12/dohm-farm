@@ -551,14 +551,16 @@ def do_unstake(page, amount=0.1):
     return 'failed-3x'
 
 def do_claim(page):
+    """Claim semua matured bonds — FIRE & FORGET (ga nunggu pending)."""
     page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
     for _ in range(20):
         time.sleep(1)
         if page.locator('button:has-text("Claim"):visible').count() > 0:
             break
     ensure_wallet(page)
-    time.sleep(3)
+    time.sleep(2)
     total = 0
+    # Klik semua claim buttons SECEPAT MUNGKIN, ga nunggu pending
     for rnd in range(10):
         n = page.locator('button:has-text("Claim"):not([disabled]):visible').count()
         if n == 0:
@@ -572,17 +574,18 @@ def do_claim(page):
                 b.scroll_into_view_if_needed()
                 b.click()
                 total += 1
-                log(f"  [claim] bond #{total} clicked")
-                wait_tx_confirm(page, f"claim-{total}", max_wait=CLAIM_MAX_WAIT)
+                log(f"  [claim] bond #{total} clicked (fire & forget)")
+                time.sleep(2)  # jeda dikit biar tx ke-submit
             except Exception as e:
                 log(f"  [claim] err: {e}")
                 break
+        # Reload buat cari claim buttons baru
         try:
             page.reload(wait_until='load', timeout=30000)
-            time.sleep(8)
+            time.sleep(3)
         except Exception:
             break
-    log(f"  [claim] total: {total}")
+    log(f"  [claim] total clicked: {total} (settlement jalan di background)")
     return 'done' if total > 0 else 'skip'
 
 # ═══════════════════════════════════════════
