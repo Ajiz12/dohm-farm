@@ -436,10 +436,20 @@ def restore_wallet(page):
         if rb.count() > 0:
             rb.first.click()
             log("  [wallet] klik Restore...")
-            time.sleep(15)
+            time.sleep(25)  # longer wait for wallet creation
+
+        # Check for error messages
+        try:
+            err_msgs = page.locator('[class*="error"], [role="alert"], text=/error|failed|invalid/i:visible')
+            for i in range(min(err_msgs.count(), 3)):
+                txt = err_msgs.nth(i).inner_text().strip()
+                if txt:
+                    log(f"  [wallet] error msg: {txt}")
+        except Exception:
+            pass
 
         page.goto(URL_STAKE, wait_until='load', timeout=30000)
-        time.sleep(10)
+        time.sleep(15)  # longer wait for page to stabilize
 
         status = check_wallet_status(page)
         log(f"  [wallet] restore result: {status}")
@@ -494,16 +504,20 @@ def ensure_wallet(page):
     elif WALLET_MODE == 'create':
         return create_wallet(page)
     else:  # auto
-        if restore_wallet(page):
-            return True
-        # restore gagal — cek apakah wallet sudah ada tapi butuh fund
-        status = check_wallet_status(page)
-        log(f"  [wallet] post-restore status: {status}")
-        if status == 'needs_fund':
-            log("  [wallet] wallet ada, tapi perlu fund (faucet by cycle)")
-            return True
+        for attempt in range(3):
+            if restore_wallet(page):
+                return True
+            # restore gagal — cek apakah wallet sudah ada tapi butuh fund
+            status = check_wallet_status(page)
+            log(f"  [wallet] post-restore status: {status} (attempt {attempt+1}/3)")
+            if status == 'needs_fund':
+                log("  [wallet] wallet ada, tapi perlu fund (faucet by cycle)")
+                return True
+            if attempt < 2:
+                log(f"  [wallet] restore gagal, retry {attempt+2}/3...")
+                time.sleep(5)
 
-        log("  [wallet] restore gagal, coba create...")
+        log("  [wallet] restore 3x gagal, coba create...")
         if create_wallet(page):
             return True
         status = check_wallet_status(page)
