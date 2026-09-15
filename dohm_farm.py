@@ -424,6 +424,13 @@ def restore_wallet(page):
         restore.first.click()
         time.sleep(3)
 
+        # Log page state after clicking Restore
+        try:
+            body = page.inner_text('body')[:500]
+            log(f"  [wallet] page state after Restore click: {body[:200]}")
+        except Exception:
+            pass
+
         ta = page.locator('textarea')
         if ta.count() > 0:
             ta.fill(SEED_PHRASE)
@@ -442,6 +449,13 @@ def restore_wallet(page):
             log("  [wallet] klik Restore...")
             time.sleep(25)  # longer wait for wallet creation
 
+        # Log page state after restore
+        try:
+            body = page.inner_text('body')[:500]
+            log(f"  [wallet] page state after restore: {body[:300]}")
+        except Exception:
+            pass
+
         # Check for error messages
         try:
             err_msgs = page.locator('[class*="error"], [role="alert"], text=/error|failed|invalid/i:visible')
@@ -452,12 +466,18 @@ def restore_wallet(page):
         except Exception:
             pass
 
-        page.goto(URL_STAKE, wait_until='load', timeout=30000)
-        time.sleep(15)  # longer wait for page to stabilize
-
+        # Check wallet status on CURRENT page first (debug proved this works)
         status = check_wallet_status(page)
-        log(f"  [wallet] restore result: {status}")
-        return status == 'connected'
+        log(f"  [wallet] restore result (current page): {status}")
+
+        if status != 'connected':
+            # Retry: navigate to stake page and check again
+            page.goto(URL_STAKE, wait_until='load', timeout=30000)
+            time.sleep(10)
+            status = check_wallet_status(page)
+            log(f"  [wallet] restore result (stake page): {status}")
+
+        return status in ('connected', 'needs_fund')
     except Exception as e:
         log(f"  [wallet] restore err: {e}")
         return False
