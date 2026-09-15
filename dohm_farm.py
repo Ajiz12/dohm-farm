@@ -465,17 +465,8 @@ def ensure_wallet(page):
 
     # needs_fund = wallet address visible tapi Stake button disabled
     if status == 'needs_fund':
-        log("  [wallet] wallet ada tapi Stake disabled, coba faucet...")
-        try_claim_faucet(page)
-        time.sleep(10)
-        status = check_wallet_status(page)
-        if status == 'connected':
-            return True
-        # Faucet gagal, coba restore ulang
-        log("  [wallet] faucet gagal, coba restore ulang...")
-        if restore_wallet(page):
-            return True
-        return False
+        log("  [wallet] wallet ada tapi Stake disabled (butuh fund)")
+        return True  # wallet IS present, faucet handled by cycle
 
     if status == 'needs_create':
         log("  [wallet] wallet belum dibuat, coba create...")
@@ -494,23 +485,16 @@ def ensure_wallet(page):
         status = check_wallet_status(page)
         log(f"  [wallet] post-restore status: {status}")
         if status == 'needs_fund':
-            log("  [wallet] wallet ada, coba faucet dulu...")
-            try_claim_faucet(page)
-            time.sleep(10)
-            status = check_wallet_status(page)
-            log(f"  [wallet] post-faucet status: {status}")
-            return status == 'connected'
+            log("  [wallet] wallet ada, tapi perlu fund (faucet by cycle)")
+            return True
 
         log("  [wallet] restore gagal, coba create...")
         if create_wallet(page):
             return True
-        # create juga gagal, cek status lagi
         status = check_wallet_status(page)
         if status == 'needs_fund':
-            log("  [wallet] wallet ada setelah create, coba faucet...")
-            try_claim_faucet(page)
-            time.sleep(10)
-            return check_wallet_status(page) == 'connected'
+            log("  [wallet] wallet ada setelah create, perlu fund")
+            return True
         return False
 
 # ═══════════════════════════════════════════
@@ -1024,6 +1008,11 @@ def run_farming_session():
             log(f"  [SEQ 1/3] Stake {STAKE_AMOUNT} DOHM...")
             r1 = retry_action(lambda: do_stake(page, STAKE_AMOUNT), tries=3, label="stake")
             log(f"  -> {r1}")
+            if r1 == 'disabled':
+                log("  [!] Stake disabled = wallet butuh fund, coba faucet...")
+                try_claim_faucet(page)
+                time.sleep(15)
+                continue  # skip cycle, coba lagi setelah faucet
             if r1 != 'done':
                 log(f"  [!] stake gagal ({r1}), skip cycle")
                 notify(f"⚠️ Stake gagal di cycle {cycle_num}: {r1}")
