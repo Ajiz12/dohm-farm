@@ -509,22 +509,42 @@ def do_stake(page, amount=0.2):
         val = fill_amount(page, amount)
         log(f"  input: '{val}'")
 
-        s = find_action_button(page, 'stake', timeout=10)
+        # Cari submit button khusus "Stake DOHM" (bukan tab "Stake")
+        s = None
+        for sel in [
+            'button:has-text("Stake DOHM"):visible:not([disabled])',
+            'button:has-text("Stake DOHM"):visible',
+        ]:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                s = loc.first
+                break
+        if not s:
+            # Fallback: scan semua button, cari yang text = "Stake DOHM"
+            all_btns = page.locator('button:visible')
+            for i in range(all_btns.count()):
+                try:
+                    txt = all_btns.nth(i).inner_text().strip()
+                    if txt == 'Stake DOHM':
+                        s = all_btns.nth(i)
+                        break
+                except Exception:
+                    pass
+
         if s:
-            txt = s.inner_text().strip()
-            if 'DOHM' in txt.upper() or 'Stake' in txt:
-                r = click_button_safe(page, s, "Stake DOHM")
-                if r == 'disabled':
-                    log("  [stake] button disabled, skip")
-                    return 'disabled'
-                time.sleep(5)  # wait for Confirm & sign modal
-                debug_dump_buttons(page, "after Stake DOHM click")
-                conf = click_confirm_sign(page)
-                log(f"  stake confirm: {conf}")
-                return 'done' if conf == 'confirmed' else conf
+            r = click_button_safe(page, s, "Stake DOHM")
+            if r == 'disabled':
+                log("  [stake] submit button disabled, skip")
+                return 'disabled'
+            time.sleep(5)  # wait for Confirm & sign modal
+            debug_dump_buttons(page, "after Stake DOHM click")
+            conf = click_confirm_sign(page)
+            log(f"  stake confirm: {conf}")
+            return 'done' if conf == 'confirmed' else conf
+
+        debug_dump_buttons(page, "no Stake DOHM submit found")
         time.sleep(2)
 
-    debug_dump_buttons(page, "stake failed")
     return 'failed-3x'
 
 def do_unstake(page, amount=0.1):
