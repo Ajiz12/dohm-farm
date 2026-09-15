@@ -281,26 +281,39 @@ def get_points(page):
 # ═══════════════════════════════════════════
 def check_wallet_status(page):
     try:
+        # Cek tombol Connect wallet
         if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
             return 'needs_connect'
         try:
             body = page.inner_text('body') or ''
         except Exception:
             return 'needs_connect'
-        # Full address: bcrt1q... or 0x...
-        if re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body) or re.search(r'\b0x[a-fA-F0-9]{40}\b', body):
-            return 'connected'
-        # Truncated address: bcrt…25pu (DOHM UI shows this)
-        if re.search(r'bcrt[\u2026\.][a-z0-9]{2,}', body):
-            return 'connected'
-        # Stake/Unstake buttons visible = wallet connected
-        for label in ['Stake DOHM', 'Unstake DOHM', 'Get BTC']:
-            if page.locator(f'button:has-text("{label}"):visible').count() > 0:
-                return 'connected'
+
+        # Cek tombol aksi ENABLED (bukan disabled)
+        for label in ['Stake DOHM', 'Unstake DOHM']:
+            btns = page.locator(f'button:has-text("{label}"):visible')
+            for i in range(btns.count()):
+                el = btns.nth(i)
+                try:
+                    dis = el.get_attribute('disabled', timeout=1000)
+                    if dis is None:  # enabled!
+                        return 'connected'
+                except Exception:
+                    pass
+
+        # Cek password input (locked)
         if page.locator('input[type="password"]').count() > 0:
             return 'needs_unlock'
+
+        # Cek "Create your testnet wallet" = wallet belum ready
         if page.locator('text=/Create.*testnet.*wallet/i').count() > 0:
             return 'needs_create'
+
+        # Cek disabled Stake button = wallet ada tapi belum funded
+        stake_disabled = page.locator('button[aria-label*="Stake"][disabled]:visible')
+        if stake_disabled.count() > 0:
+            return 'needs_fund'  # wallet ada, tapi perlu BTC/frBTC
+
     except Exception:
         pass
     return 'needs_connect'
@@ -440,6 +453,26 @@ def ensure_wallet(page):
         status = check_wallet_status(page)
         if status == 'connected':
             return True
+
+    # needs_fund = wallet address visible tapi Stake button disabled
+    if status == 'needs_fund':
+        log("  [wallet] wallet ada tapi Stake disabled, coba faucet...")
+        do_faucet(page)
+        time.sleep(10)
+        status = check_wallet_status(page)
+        if status == 'connected':
+            return True
+        # Faucet gagal, coba restore ulang
+        log("  [wallet] faucet gagal, coba restore ulang...")
+        if restore_wallet(page):
+            return True
+        return False
+
+    if status == 'needs_create':
+        log("  [wallet] wallet belum dibuat, coba create...")
+        if create_wallet(page):
+            return True
+        return False
 
     if WALLET_MODE == 'restore':
         return restore_wallet(page)
@@ -589,16 +622,13 @@ def get_sohm_balance(page):
 
 def do_stake(page, amount=0.2):
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
-    for _ in range(6):
-        time.sleep(3)
-        if page.locator('button:has-text("Stake"):visible').count() > 0:
-            break
+    wait_dom_stable(page, timeout=15)
     for attempt in range(3):
         active = verify_tab(page)
         if active != 'Stake':
-            t = page.locator('button:has-text("Stake"):visible')
-            if t.count() > 0:
-                t.first.click()
+            t = find_action_button(page, 'stake', timeout=10)
+            if t:
+                click_button_safe(page, t, "Stake tab")
             time.sleep(3)
             active = verify_tab(page)
         if active != 'Stake':
@@ -606,29 +636,32 @@ def do_stake(page, amount=0.2):
             continue
         val = fill_amount(page, amount)
         log(f"  input: '{val}'")
-        s = page.locator('button:has-text("Stake DOHM"):not([disabled]):visible')
-        if s.count() > 0:
-            s.first.scroll_into_view_if_needed()
-            s.first.click()
-            time.sleep(2)
-            conf = click_confirm_sign(page)
-            log(f"  stake confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+        s = find_action_button(page, 'stake', timeout=10)
+        if s:
+            txt = s.inner_text().strip()
+            if 'DOHM' in txt.upper() or 'Stake' in txt:
+                r = click_button_safe(page, s, "Stake DOHM")
+                if r == 'disabled':
+                    log("  [stake] button disabled, skip")
+                    return 'disabled'
+                time.sleep(2)
+                conf = click_confirm_sign(page)
+                log(f"  stake confirm: {conf}")
+                return 'done' if conf == 'confirmed' else conf
         time.sleep(2)
     return 'failed-3x'
 
 def do_unstake(page, amount=0.1):
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
-    for _ in range(6):
-        time.sleep(3)
-        if page.locator('button:has-text("Unstake"):visible').count() > 0:
-            break
+    wait_dom_stable(page, timeout=15)
+    t = find_action_button(page, 'unstake', timeout=10)
+    if t:
+        click_button_safe(page, t, "Unstake tab")
+    time.sleep(3)
     active = verify_tab(page)
     if active != 'Unstake':
-        t = page.locator('button:has-text("Unstake"):visible')
-        if t.count() > 0:
-            t.first.click()
-        time.sleep(3)
+        log(f"  tab ga pindah ke Unstake (masih {active})")
+        return 'tab-fail'
     bal = get_sohm_balance(page)
     if bal <= 0:
         log(f"  no sDOHM ({bal})")
