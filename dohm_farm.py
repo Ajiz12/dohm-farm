@@ -490,9 +490,27 @@ def ensure_wallet(page):
     else:  # auto
         if restore_wallet(page):
             return True
+        # restore gagal — cek apakah wallet sudah ada tapi butuh fund
+        status = check_wallet_status(page)
+        log(f"  [wallet] post-restore status: {status}")
+        if status == 'needs_fund':
+            log("  [wallet] wallet ada, coba faucet dulu...")
+            do_faucet(page)
+            time.sleep(10)
+            status = check_wallet_status(page)
+            log(f"  [wallet] post-faucet status: {status}")
+            return status == 'connected'
+
         log("  [wallet] restore gagal, coba create...")
         if create_wallet(page):
             return True
+        # create juga gagal, cek status lagi
+        status = check_wallet_status(page)
+        if status == 'needs_fund':
+            log("  [wallet] wallet ada setelah create, coba faucet...")
+            do_faucet(page)
+            time.sleep(10)
+            return check_wallet_status(page) == 'connected'
         return False
 
 # ═══════════════════════════════════════════
