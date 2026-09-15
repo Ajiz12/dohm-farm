@@ -380,16 +380,25 @@ def restore_wallet(page):
         connect = page.locator('button:has-text("Connect wallet"):visible')
         if connect.count() > 0:
             connect.first.click()
-            time.sleep(2)
+            time.sleep(3)
 
-        # Tunggu modal muncul
-        for _ in range(10):
+        # Tunggu modal muncul (max 20s)
+        for _ in range(20):
             time.sleep(1)
             restore = page.locator('button:has-text("Restore from recovery phrase"):visible')
             if restore.count() > 0:
+                log("  [wallet] modal ketemu, klik Restore...")
                 break
 
         restore = page.locator('button:has-text("Restore from recovery phrase"):visible')
+        if restore.count() == 0:
+            # Try clicking Connect wallet again (maybe modal closed)
+            connect2 = page.locator('button:has-text("Connect wallet"):visible')
+            if connect2.count() > 0:
+                connect2.first.click()
+                time.sleep(5)
+            restore = page.locator('button:has-text("Restore from recovery phrase"):visible')
+
         if restore.count() == 0:
             log("  [wallet] tombol 'Restore from recovery phrase' ga ketemu")
             return False
