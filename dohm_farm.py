@@ -404,15 +404,25 @@ def check_and_recover_wallet(page):
 # STAKE / UNSTAKE / CLAIM
 # ═══════════════════════════════════════════
 def fill_amount(page, amount):
-    """Fill amount input (React-compatible)."""
+    """Fill amount input (React-compatible — use keyboard + dispatch events)."""
     inp = page.locator('input:visible:not([disabled])').first
     if inp.count() == 0:
         return 'none'
     inp.click()
-    inp.fill('')
     time.sleep(0.3)
-    inp.fill(str(amount))
+    # Select all and delete
+    page.keyboard.press('Control+a')
+    page.keyboard.press('Backspace')
+    time.sleep(0.3)
+    # Type character by character (triggers React onChange)
+    page.keyboard.type(str(amount), delay=50)
     time.sleep(2)
+    # Also dispatch input event as fallback
+    try:
+        inp.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); }")
+    except Exception:
+        pass
+    time.sleep(1)
     return inp.input_value()
 
 def verify_tab(page):
@@ -507,7 +517,8 @@ def do_stake(page, amount=0.2):
                 if r == 'disabled':
                     log("  [stake] button disabled, skip")
                     return 'disabled'
-                time.sleep(2)
+                time.sleep(5)  # wait for Confirm & sign modal
+                debug_dump_buttons(page, "after Stake DOHM click")
                 conf = click_confirm_sign(page)
                 log(f"  stake confirm: {conf}")
                 return 'done' if conf == 'confirmed' else conf
