@@ -122,6 +122,116 @@ def heartbeat(payload: str):
         pass
 
 # ═══════════════════════════════════════════
+# DOM HELPERS (fleksibel button detection)
+# ═══════════════════════════════════════════
+def wait_dom_stable(page, timeout=15):
+    """Tunggu DOM stabil (ga berubah 2x berturut-turut)."""
+    end = time.time() + timeout
+    prev_len = -1
+    stable_count = 0
+    while time.time() < end:
+        try:
+            cur_len = page.evaluate("() => document.body.innerHTML.length")
+        except Exception:
+            time.sleep(1)
+            continue
+        if cur_len == prev_len:
+            stable_count += 1
+            if stable_count >= 2:
+                return True
+        else:
+            stable_count = 0
+        prev_len = cur_len
+        time.sleep(1)
+    return False
+
+def find_action_button(page, action, timeout=30):
+    """Cari tombol aksi (Stake/Unstake/Claim) dengan selector fleksibel."""
+    patterns = {
+        'stake':   [r'^Stake$', r'^Stake\s+DOHM$', r'^STAKE', r'Stake'],
+        'unstake': [r'^Unstake$', r'^Unstake\s+DOHM$', r'^UNSTAKE', r'Unstake'],
+        'claim':   [r'^Claim$', r'^CLAIM', r'Claim'],
+    }
+    end = time.time() + timeout
+    while time.time() < end:
+        # cara 1: has-text exact
+        for pat in patterns.get(action, []):
+            try:
+                clean_pat = pat.strip("^$"); loc = page.locator(f'button:has-text("{clean_pat}")')
+                for i in range(loc.count()):
+                    el = loc.nth(i)
+                    try:
+                        if not el.is_visible():
+                            continue
+                        txt = el.inner_text().strip()
+                        if re.match(pat, txt, re.IGNORECASE):
+                            return el
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # cara 2: scan semua button
+        try:
+            all_btns = page.locator('button:visible')
+            n = all_btns.count()
+            for i in range(min(n, 50)):
+                try:
+                    el = all_btns.nth(i)
+                    txt = el.inner_text().strip()
+                    for pat in patterns.get(action, []):
+                        if re.match(pat, txt, re.IGNORECASE):
+                            return el
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # cara 3: aria-label fallback
+        try:
+            for sel in [
+                f'button[aria-label*="{action}" i]',
+                f'button[data-testid*="{action}" i]',
+            ]:
+                loc = page.locator(sel)
+                for i in range(loc.count()):
+                    el = loc.nth(i)
+                    if el.is_visible():
+                        return el
+        except Exception:
+            pass
+
+        time.sleep(1)
+    return None
+
+def click_button_safe(page, btn, label="", force_fallback=True):
+    """Klik tombol dengan aman + force click fallback."""
+    try:
+        btn.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    try:
+        dis = btn.get_attribute('disabled', timeout=2000)
+        if dis is not None:
+            log(f"  [click] '{label}' disabled")
+            return 'disabled'
+    except Exception:
+        pass
+    try:
+        btn.click(timeout=5000)
+        return 'ok'
+    except Exception as e:
+        log(f"  [click] '{label}' normal click err: {e}")
+    if force_fallback:
+        try:
+            btn.click(force=True, timeout=5000)
+            log(f"  [click] '{label}' force click OK")
+            return 'ok'
+        except Exception as e:
+            log(f"  [click] '{label}' force click err: {e}")
+    return 'failed'
+
+# ═══════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════
 def sleep_fixed(min_s=5, max_s=15, label=""):
