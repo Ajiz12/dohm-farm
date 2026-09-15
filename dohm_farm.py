@@ -205,7 +205,7 @@ def find_action_button(page, action, timeout=30):
     return None
 
 def click_button_safe(page, btn, label="", force_fallback=True):
-    """Klik tombol dengan aman + force click fallback."""
+    """Klik tombol dengan aman: normal → force → JS click."""
     try:
         btn.scroll_into_view_if_needed(timeout=5000)
     except Exception:
@@ -229,7 +229,22 @@ def click_button_safe(page, btn, label="", force_fallback=True):
             return 'ok'
         except Exception as e:
             log(f"  [click] '{label}' force click err: {e}")
+    # fallback terakhir: JS click
+    try:
+        btn.evaluate("el => el.click()")
+        log(f"  [click] '{label}' JS click OK")
+        return 'ok'
+    except Exception as e:
+        log(f"  [click] '{label}' JS click err: {e}")
     return 'failed'
+
+def check_and_recover_wallet(page):
+    """Kalau wallet tiba-tiba needs_connect, coba restore ulang."""
+    s = check_wallet_status(page)
+    if s == 'connected':
+        return True
+    log(f"  [wallet] tiba-tiba {s}, recovery...")
+    return ensure_wallet(page)
 
 # ═══════════════════════════════════════════
 # HELPERS
@@ -939,6 +954,9 @@ def run_farming_session():
             log(f"CYCLE {cycle_num}{'/' + str(MAX_CYCLES) if MAX_CYCLES else ' (infinite)'} | "
                 f"{datetime.now().strftime('%H:%M:%S')}")
             log(f"{'=' * 60}")
+
+            # ── WALLET RECOVERY CHECK ──
+            check_and_recover_wallet(page)
 
             pts = get_points(page)
             heartbeat(f"cycle={cycle_num} pts={pts:.2f} claims={state['claim_count']}")
