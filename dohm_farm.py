@@ -419,17 +419,27 @@ def check_and_recover_wallet(page):
 # ═══════════════════════════════════════════
 def check_wallet_status(page):
     try:
-        if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
-            return 'needs_connect'
+        # 1) cek tombol/btn dengan text bcrt (address truncated: bcrt…25pu)
+        for i in range(min(page.locator('button:visible').count(), 30)):
+            try:
+                txt = page.locator('button:visible').nth(i).inner_text().strip()
+                if 'bcrt' in txt.lower():
+                    return 'connected'
+            except Exception:
+                pass
+        # 2) cek body text — full address
         try:
             body = page.inner_text('body') or ''
         except Exception:
             return 'needs_connect'
-        if re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body) or re.search(r'\b0x[a-fA-F0-9]{40}\b', body):
+        if re.search(r'bcrt1q[a-z0-9]{20,}', body) or re.search(r'\bbcrt\b', body):
             return 'connected'
-        for label in ['Stake DOHM', 'Unstake DOHM']:
-            if page.locator(f'button:has-text("{label}"):not([disabled]):visible').count() > 0:
-                return 'connected'
+        if re.search(r'0x[a-fA-F0-9]{40}', body):
+            return 'connected'
+        # 3) cek Connect wallet btn — visible = needs connect
+        if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
+            return 'needs_connect'
+        # 4) cek password input — needs unlock
         if page.locator('input[type="password"]').count() > 0:
             return 'needs_unlock'
     except Exception:
