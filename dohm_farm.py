@@ -466,7 +466,7 @@ def ensure_wallet(page):
     # needs_fund = wallet address visible tapi Stake button disabled
     if status == 'needs_fund':
         log("  [wallet] wallet ada tapi Stake disabled, coba faucet...")
-        do_faucet(page)
+        try_claim_faucet(page)
         time.sleep(10)
         status = check_wallet_status(page)
         if status == 'connected':
@@ -495,7 +495,7 @@ def ensure_wallet(page):
         log(f"  [wallet] post-restore status: {status}")
         if status == 'needs_fund':
             log("  [wallet] wallet ada, coba faucet dulu...")
-            do_faucet(page)
+            try_claim_faucet(page)
             time.sleep(10)
             status = check_wallet_status(page)
             log(f"  [wallet] post-faucet status: {status}")
@@ -508,7 +508,7 @@ def ensure_wallet(page):
         status = check_wallet_status(page)
         if status == 'needs_fund':
             log("  [wallet] wallet ada setelah create, coba faucet...")
-            do_faucet(page)
+            try_claim_faucet(page)
             time.sleep(10)
             return check_wallet_status(page) == 'connected'
         return False
