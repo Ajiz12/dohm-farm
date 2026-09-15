@@ -49,6 +49,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
 NOTIFY_EVERY_PTS   = float(os.environ.get('NOTIFY_EVERY_PTS', '25'))
 
+RESTART_EVERY_CYCLES = int(os.environ.get('RESTART_EVERY_CYCLES', '200'))
 FAUCET_ENABLED   = int(os.environ.get('FAUCET_ENABLED', '1'))
 FAUCET_MIN_HOURS = float(os.environ.get('FAUCET_MIN_HOURS', '6'))
 FAUCET_MAX_HOURS = float(os.environ.get('FAUCET_MAX_HOURS', '12'))
@@ -772,6 +773,13 @@ def run_farming_session():
                 log(f"[END] Max cycles ({MAX_CYCLES}) reached.")
                 state['stop'] = True
                 return True
+
+            # ── AUTO-RESTART TIAP N CYCLES (anti OOM) ──
+            if RESTART_EVERY_CYCLES > 0 and cycle_num % RESTART_EVERY_CYCLES == 0:
+                log(f"[RESTART] {cycle_num} cycles done, restart untuk clear memory...")
+                notify(f"🔄 <b>Auto-restart</b> setelah {cycle_num} cycles (anti OOM)")
+                state['stop'] = True
+                return False  # supervisor akan restart
 
             log(f"\n{'=' * 60}")
             log(f"CYCLE {cycle_num}{'/' + str(MAX_CYCLES) if MAX_CYCLES else ' (infinite)'} | "
