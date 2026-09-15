@@ -392,13 +392,17 @@ def restore_wallet(page):
 
     log("  [wallet] mencoba RESTORE dari seed...")
     try:
+        # Reload page dulu biar clean state
+        page.goto(URL_STAKE, wait_until='load', timeout=30000)
+        time.sleep(5)
+
         connect = page.locator('button:has-text("Connect wallet"):visible')
         if connect.count() > 0:
             connect.first.click()
-            time.sleep(3)
+            time.sleep(5)  # longer wait for modal
 
-        # Tunggu modal muncul (max 20s)
-        for _ in range(20):
+        # Tunggu modal muncul (max 25s)
+        for _ in range(25):
             time.sleep(1)
             restore = page.locator('button:has-text("Restore from recovery phrase"):visible')
             if restore.count() > 0:
