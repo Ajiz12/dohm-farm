@@ -973,6 +973,7 @@ def run_farming_session():
         cycle_start = time.time()
         cycle_num = 0
         next_faucet_time = time.time()
+        faucet_result = None
 
         while not state['stop']:
             cycle_num += 1
@@ -1056,14 +1057,13 @@ def run_farming_session():
                 page.goto(URL_STAKE, wait_until='load', timeout=30000)
                 time.sleep(3)
 
-            # ── SKIP IF WALLET NEEDS FUND ──
+            # ── SKIP IF WALLET NEEDS FUND OR FAUCET COOLDOWN ──
             ws = check_wallet_status(page)
             if ws in ('needs_fund', 'needs_connect'):
                 wait_secs = max(0, next_faucet_time - time.time())
                 if wait_secs > 60:
                     log(f"  [SKIP] Wallet {ws}, waiting {wait_secs/3600:.1f}h for faucet...")
                     notify(f"⏸️ Wallet {ws} — skip sampai faucet ({wait_secs/3600:.1f}h)")
-                    # Sleep in chunks, heartbeat setiap 30 menit
                     while time.time() < next_faucet_time and not state['stop']:
                         chunk = min(1800, next_faucet_time - time.time())
                         heartbeat(f"waiting faucet in {chunk/3600:.1f}h")
@@ -1072,6 +1072,17 @@ def run_farming_session():
                 else:
                     log(f"  [SKIP] Wallet {ws}, faucet sebentar lagi...")
                     time.sleep(30)
+                    continue
+
+            # Skip if faucet was on cooldown last cycle (no BTC for gas)
+            if faucet_result == 'cooldown' and time.time() < next_faucet_time:
+                wait_secs = next_faucet_time - time.time()
+                log(f"  [SKIP] Faucet cooldown, waiting {wait_secs/3600:.1f}h...")
+                if wait_secs > 60:
+                    while time.time() < next_faucet_time and not state['stop']:
+                        chunk = min(1800, next_faucet_time - time.time())
+                        heartbeat(f"faucet cooldown {chunk/3600:.1f}h left")
+                        time.sleep(min(chunk, 1800))
                     continue
 
             # ════════════════════════════════════════
