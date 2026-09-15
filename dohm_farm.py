@@ -456,12 +456,13 @@ def restore_wallet(page):
         page.locator('button:has-text("Connect wallet"):visible').first.click()
     except Exception:
         return False
-    time.sleep(2)
+    time.sleep(10)  # tunggu modal muncul (DOHM lambat)
     r = page.locator('button:has-text("Restore from recovery phrase"):visible')
     if r.count() == 0:
+        log("  [wallet] 'Restore from recovery phrase' ga ketemu")
         return False
     r.first.click()
-    time.sleep(2)
+    time.sleep(5)
     ta = page.locator('textarea')
     if ta.count() > 0:
         ta.fill(SEED_PHRASE)
@@ -473,9 +474,9 @@ def restore_wallet(page):
     rb = page.locator('button:has-text("Restore"):visible')
     if rb.count() > 0:
         rb.first.click()
-        time.sleep(10)
+        time.sleep(15)  # tunggu restore selesai
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
-    time.sleep(8)
+    time.sleep(10)
     return check_wallet_status(page) == 'connected'
 
 def ensure_wallet(page):
