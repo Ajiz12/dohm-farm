@@ -296,38 +296,38 @@ def get_points(page):
 # ═══════════════════════════════════════════
 def check_wallet_status(page):
     try:
-        # Cek tombol Connect wallet
-        if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
-            return 'needs_connect'
         try:
             body = page.inner_text('body') or ''
         except Exception:
             return 'needs_connect'
 
-        # Cek tombol aksi ENABLED (bukan disabled)
-        for label in ['Stake DOHM', 'Unstake DOHM']:
-            btns = page.locator(f'button:has-text("{label}"):visible')
-            for i in range(btns.count()):
-                el = btns.nth(i)
-                try:
-                    dis = el.get_attribute('disabled', timeout=1000)
-                    if dis is None:  # enabled!
-                        return 'connected'
-                except Exception:
-                    pass
+        # CHECK BCRT ADDRESS FIRST — this is the strongest signal wallet is connected
+        if re.search(r'bcrt[\u2026\.][a-z0-9]{2,}', body) or re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body):
+            # Wallet address found — check if Stake is enabled or disabled
+            for label in ['Stake DOHM', 'Unstake DOHM']:
+                btns = page.locator(f'button:has-text("{label}"):visible')
+                for i in range(btns.count()):
+                    el = btns.nth(i)
+                    try:
+                        dis = el.get_attribute('disabled', timeout=1000)
+                        if dis is None:  # enabled!
+                            return 'connected'
+                    except Exception:
+                        pass
+            # Address visible but Stake disabled = needs fund
+            stake_disabled = page.locator('button[aria-label*="Stake"][disabled]:visible')
+            if stake_disabled.count() > 0:
+                return 'needs_fund'
+            # Address visible, Stake not found yet
+            return 'connected'
 
-        # Cek password input (locked)
+        # No bcrt address — check other signals
+        if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
+            return 'needs_connect'
         if page.locator('input[type="password"]').count() > 0:
             return 'needs_unlock'
-
-        # Cek "Create your testnet wallet" = wallet belum ready
         if page.locator('text=/Create.*testnet.*wallet/i').count() > 0:
             return 'needs_create'
-
-        # Cek disabled Stake button = wallet ada tapi belum funded
-        stake_disabled = page.locator('button[aria-label*="Stake"][disabled]:visible')
-        if stake_disabled.count() > 0:
-            return 'needs_fund'  # wallet ada, tapi perlu BTC/frBTC
 
     except Exception:
         pass
@@ -447,7 +447,7 @@ def restore_wallet(page):
         if rb.count() > 0:
             rb.first.click()
             log("  [wallet] klik Restore...")
-            time.sleep(25)  # longer wait for wallet creation
+            time.sleep(35)  # debug proved 30s works, add buffer
 
         # Log page state after restore
         try:
