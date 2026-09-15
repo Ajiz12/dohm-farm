@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-DOHM Farming v19 + Fix Selector
-- Sequential (no threads — Playwright sync API thread-unsafe)
-- Selector fleksibel (regex + scan + aria fallback)
-- Auto-recover wallet kalau tiba-tiba needs_connect
-- Debug dump tombol kalau gagal
-- Auto-restart supervisor
+DOHM Farming v21 - FAST FLOW
+Flow per cycle:
+  Stake 0.2 -> klik "Stake DOHM" -> tunggu "Confirm & Stake" -> klik -> DONE
+  -> Unstake 0.1 -> klik "Unstake DOHM" -> tunggu "Confirm & Sign" -> klik -> DONE
+  -> Claim (fire & forget, no wait) -> next cycle LANGSUNG
 """
 import os
 import sys
@@ -39,11 +38,9 @@ UNSTAKE_AMOUNT= float(os.environ.get('UNSTAKE_AMOUNT', '0.1'))
 JEDA_MIN = int(os.environ.get('JEDA_MIN', '5'))
 JEDA_MAX = int(os.environ.get('JEDA_MAX', '15'))
 
-TX_WAIT_MAX      = int(os.environ.get('TX_WAIT_MAX', '900'))
-TX_POLL_INTERVAL = int(os.environ.get('TX_POLL_INTERVAL', '5'))
-GRACE_MIN = int(os.environ.get('GRACE_MIN', '10'))
-GRACE_MAX = int(os.environ.get('GRACE_MAX', '20'))
-CLAIM_MAX_WAIT = int(os.environ.get('CLAIM_MAX_WAIT', '600'))
+# timeout tunggu tab konfirmasi
+CONFIRM_TAB_TIMEOUT = int(os.environ.get('CONFIRM_TAB_TIMEOUT', '20'))
+DONE_TIMEOUT        = int(os.environ.get('DONE_TIMEOUT', '10'))
 
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID   = os.environ.get('TELEGRAM_CHAT_ID', '')
@@ -75,6 +72,7 @@ state = {
     'wallet_ok': False,
     'current_cycle': 0,
     'stake_fail_streak': 0,
+    'claim_count': 0,
 }
 
 start_time = time.time()
@@ -118,7 +116,90 @@ def heartbeat(payload: str):
         pass
 
 # ═══════════════════════════════════════════
-# DOM HELPERS (fleksibel button detection)
+# AUTO UPDATE
+# ═══════════════════════════════════════════
+def check_and_update():
+    if not AUTO_UPDATE or not UPDATE_URL:
+        return False
+    try:
+        log(f"[UPDATE] cek {UPDATE_URL}")
+        req = urllib.request.Request(UPDATE_URL, headers={'User-Agent': 'dohm-farm'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            remote = r.read()
+        local = open(SCRIPT_PATH, 'rb').read()
+        if hashlib.sha256(remote).hexdigest() == hashlib.sha256(local).hexdigest():
+            log("[UPDATE] sudah terbaru")
+            return False
+        with open(SCRIPT_PATH + '.bak', 'wb') as f:
+            f.write(local)
+        with open(SCRIPT_PATH, 'wb') as f:
+            f.write(remote)
+        os.chmod(SCRIPT_PATH, 0o755)
+        notify("🔄 <b>Auto-update</b> — restart otomatis...")
+        time.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        log(f"[UPDATE] error: {e}")
+    return False
+
+# ═══════════════════════════════════════════
+# LOCK
+# ═══════════════════════════════════════════
+def acquire_lock():
+    f = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+    except BlockingIOError:
+        log("[LOCK] Script lain masih jalan.")
+        return None
+
+# ═══════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════
+def sleep_fixed(min_s=5, max_s=15, label=""):
+    total = random.uniform(min_s, max_s)
+    log(f"  [jeda] {label}: {total:.1f}s")
+    end = time.time() + total
+    while time.time() < end and not state['stop']:
+        time.sleep(min(1, end - time.time()))
+
+def get_tx_hash(page):
+    try:
+        txt = page.inner_text('body') or ''
+        for pat in (r'(0x[a-fA-F0-9]{64})', r'([a-f0-9]{8,}\.[a-f0-9]{4,})', r'\b([a-f0-9]{64})\b'):
+            m = re.findall(pat, txt)
+            if m: return m[-1]
+    except Exception:
+        pass
+    return None
+
+def read_points_no_nav(page):
+    try:
+        txt = page.inner_text('body') or ''
+        for pat in (r'(\d+\.?\d*)\s*pts', r'[Pp]oints?\s*[:=]?\s*(\d+\.?\d*)'):
+            m = re.search(pat, txt, re.IGNORECASE)
+            if m:
+                return float(m.group(1))
+    except Exception:
+        pass
+    return None
+
+def get_points(page):
+    try:
+        page.goto(URL_STAKE, wait_until='load', timeout=30000)
+        for _ in range(15):
+            time.sleep(3)
+            pts = read_points_no_nav(page)
+            if pts and pts > 0:
+                return pts
+        return 0
+    except Exception as e:
+        log(f"  [get_points error] {e}")
+        return 0
+
+# ═══════════════════════════════════════════
+# SELECTOR FLEKSIBEL
 # ═══════════════════════════════════════════
 def wait_dom_stable(page, timeout=15):
     """Tunggu DOM stabil (ga berubah 2x berturut-turut)."""
@@ -142,11 +223,7 @@ def wait_dom_stable(page, timeout=15):
     return False
 
 def find_action_button(page, action, timeout=30):
-    """
-    Cari tombol aksi (Stake/Unstake/Claim) dengan selector fleksibel.
-    action: 'stake' | 'unstake' | 'claim'
-    Return: locator atau None
-    """
+    """Cari tombol aksi (stake/unstake/claim) dengan selector fleksibel."""
     patterns = {
         'stake':   [r'^Stake$', r'^Stake\s+DOHM$', r'^STAKE', r'Stake'],
         'unstake': [r'^Unstake$', r'^Unstake\s+DOHM$', r'^UNSTAKE', r'Unstake'],
@@ -154,11 +231,10 @@ def find_action_button(page, action, timeout=30):
     }
     end = time.time() + timeout
     while time.time() < end:
-        # cara 1: has-text exact
         for pat in patterns.get(action, []):
-            clean_pat = pat.strip("^$")
+            clean = pat.strip("^$\\")
             try:
-                loc = page.locator(f'button:has-text("{clean_pat}")')
+                loc = page.locator(f'button:has-text("{clean}")')
                 for i in range(loc.count()):
                     el = loc.nth(i)
                     try:
@@ -172,7 +248,6 @@ def find_action_button(page, action, timeout=30):
             except Exception:
                 pass
 
-        # cara 2: scan semua button, filter by text
         try:
             all_btns = page.locator('button:visible')
             n = all_btns.count()
@@ -188,12 +263,10 @@ def find_action_button(page, action, timeout=30):
         except Exception:
             pass
 
-        # cara 3: aria-label / data-testid fallback
         try:
             for sel in [
                 f'button[aria-label*="{action}" i]',
                 f'button[data-testid*="{action}" i]',
-                f'[role="button"][aria-label*="{action}" i]',
             ]:
                 loc = page.locator(sel)
                 for i in range(loc.count()):
@@ -207,20 +280,12 @@ def find_action_button(page, action, timeout=30):
     return None
 
 def click_button_safe(page, btn, label="", force_fallback=True):
-    """
-    Klik tombol dengan aman:
-    1. scroll into view
-    2. cek enabled
-    3. klik normal
-    4. fallback: force click kalau enabled tapi ga bisa diklik
-    5. fallback terakhir: JS click
-    """
+    """Klik tombol: normal → force → JS click."""
     try:
         btn.scroll_into_view_if_needed(timeout=5000)
     except Exception:
         pass
 
-    # cek disabled
     try:
         dis = btn.get_attribute('disabled', timeout=2000)
         if dis is not None:
@@ -229,14 +294,12 @@ def click_button_safe(page, btn, label="", force_fallback=True):
     except Exception:
         pass
 
-    # coba klik normal
     try:
         btn.click(timeout=5000)
         return 'ok'
     except Exception as e:
         log(f"  [click] '{label}' normal click err: {e}")
 
-    # fallback: force click
     if force_fallback:
         try:
             btn.click(force=True, timeout=5000)
@@ -245,7 +308,6 @@ def click_button_safe(page, btn, label="", force_fallback=True):
         except Exception as e:
             log(f"  [click] '{label}' force click err: {e}")
 
-    # fallback terakhir: JS click
     try:
         btn.evaluate("el => el.click()")
         log(f"  [click] '{label}' JS click OK")
@@ -255,426 +317,475 @@ def click_button_safe(page, btn, label="", force_fallback=True):
 
     return 'fail'
 
-def debug_dump_buttons(page, label=""):
-    """Debug: dump semua visible buttons ke log."""
+def dump_visible_buttons(page, label=""):
+    """Log semua tombol visible, buat debug."""
     try:
         btns = page.locator('button:visible')
         n = btns.count()
-        log(f"  [debug] {label} — {n} visible buttons:")
+        texts = []
         for i in range(min(n, 20)):
             try:
-                txt = btns.nth(i).inner_text().strip()[:60]
-                dis = btns.nth(i).get_attribute('disabled')
-                log(f"    [{i}] '{txt}' disabled={dis}")
+                txt = btns.nth(i).inner_text().strip()[:40]
+                if txt:
+                    texts.append(txt)
             except Exception:
                 pass
-    except Exception:
-        pass
+        log(f"  [{label}] visible buttons ({n}): {texts}")
+    except Exception as e:
+        log(f"  [{label}] dump buttons err: {e}")
+
+def click_done_button(page, timeout=10):
+    """Klik tombol DONE / OK / Close setelah confirm."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for sel in [
+            'button:has-text("DONE")',
+            'button:has-text("Done")',
+            'button:has-text("done")',
+            'button:has-text("Close")',
+            'button:has-text("OK")',
+            'button:has-text("Okay")',
+            '[role="button"]:has-text("DONE")',
+        ]:
+            btn = page.locator(sel)
+            for i in range(btn.count()):
+                try:
+                    el = btn.nth(i)
+                    if el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        el.click(timeout=3000)
+                        log(f"  [done] klik '{sel.strip()}'")
+                        time.sleep(2)
+                        return True
+                except Exception:
+                    continue
+        time.sleep(1)
+    log("  [done] tombol DONE ga ketemu (skip)")
+    return False
+
+def wait_confirm_tab(page, mode="stake", timeout=None):
+    """
+    Tunggu tab konfirmasi muncul.
+    mode: 'stake' → "Confirm & Stake"
+          'unstake' → "Confirm & Sign"
+    """
+    if timeout is None:
+        timeout = CONFIRM_TAB_TIMEOUT
+
+    if mode == "stake":
+        patterns = [
+            'button:has-text("Confirm & Stake")',
+            'button:has-text("Confirm & stake")',
+            'button:has-text("Confirm and Stake")',
+            'button:has-text("Confirm Stake")',
+            'button:has-text("CONFIRM & STAKE")',
+        ]
+    else:  # unstake
+        patterns = [
+            'button:has-text("Confirm & Sign")',
+            'button:has-text("Confirm & sign")',
+            'button:has-text("Confirm and Sign")',
+            'button:has-text("Confirm Sign")',
+            'button:has-text("CONFIRM & SIGN")',
+        ]
+
+    end = time.time() + timeout
+    while time.time() < end:
+        for sel in patterns:
+            try:
+                loc = page.locator(sel)
+                for i in range(loc.count()):
+                    el = loc.nth(i)
+                    if el.is_visible():
+                        txt = el.inner_text().strip()
+                        log(f"  [confirm-tab] ketemu '{txt}'")
+                        return el
+            except Exception:
+                continue
+        time.sleep(1)
+
+    log(f"  [confirm-tab] mode={mode}: ga ketemu dalam {timeout}s")
+    return None
+
+def check_and_recover_wallet(page):
+    s = check_wallet_status(page)
+    if s == 'connected':
+        return True
+    log(f"  [wallet] tiba-tiba {s}, recovery...")
+    return ensure_wallet(page)
 
 # ═══════════════════════════════════════════
 # WALLET
 # ═══════════════════════════════════════════
 def check_wallet_status(page):
-    """Cek status wallet: connected, needs_connect, needs_fund, needs_unlock."""
     try:
+        if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
+            return 'needs_connect'
         try:
             body = page.inner_text('body') or ''
         except Exception:
             return 'needs_connect'
-
-        # CHECK BCRT ADDRESS FIRST — strongest signal wallet is connected
-        if re.search(r'bcrt[\u2026\.][a-z0-9]{2,}', body) or re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body):
-            # Wallet address found — check if Stake is enabled or disabled
-            for label in ['Stake DOHM', 'Unstake DOHM']:
-                btns = page.locator(f'button:has-text("{label}"):visible')
-                for i in range(btns.count()):
-                    el = btns.nth(i)
-                    try:
-                        dis = el.get_attribute('disabled', timeout=1000)
-                        if dis is None:  # enabled!
-                            return 'connected'
-                    except Exception:
-                        pass
-            # Address visible but Stake disabled = needs fund
-            stake_disabled = page.locator('button[aria-label*="Stake"][disabled]:visible')
-            if stake_disabled.count() > 0:
-                return 'needs_fund'
-            # Address visible, Stake not found yet
+        if re.search(r'\bbcrt1q[a-z0-9]{20,}\b', body) or re.search(r'\b0x[a-fA-F0-9]{40}\b', body):
             return 'connected'
-
-        # No bcrt address — check other signals
-        if page.locator('button:has-text("Connect wallet"):visible').count() > 0:
-            return 'needs_connect'
+        for label in ['Stake DOHM', 'Unstake DOHM']:
+            if page.locator(f'button:has-text("{label}"):not([disabled]):visible').count() > 0:
+                return 'connected'
         if page.locator('input[type="password"]').count() > 0:
             return 'needs_unlock'
-        if page.locator('text=/Create.*testnet.*wallet/i').count() > 0:
-            return 'needs_create'
-
     except Exception:
         pass
     return 'needs_connect'
 
-def restore_wallet(page):
-    """Restore wallet dari seed phrase."""
-    if not SEED_PHRASE:
-        log("  [wallet] SEED_PHRASE kosong")
-        return False
-
-    log("  [wallet] RESTORE dari seed...")
+def unlock_wallet(page):
     try:
-        # Reload page dulu biar clean state
-        page.goto(URL_STAKE, wait_until='load', timeout=30000)
-        time.sleep(5)
-
-        connect = page.locator('button:has-text("Connect wallet"):visible')
-        if connect.count() > 0:
-            connect.first.click()
-            time.sleep(5)
-
-        # Tunggu modal muncul (max 25s)
-        restore_btn = None
-        for _ in range(25):
-            time.sleep(1)
-            restore_btn = page.locator('button:has-text("Restore from recovery phrase"):visible')
-            if restore_btn.count() > 0:
-                log("  [wallet] modal ketemu")
-                break
-
-        if not restore_btn or restore_btn.count() == 0:
-            # Retry: klik Connect wallet lagi
-            connect2 = page.locator('button:has-text("Connect wallet"):visible')
-            if connect2.count() > 0:
-                connect2.first.click()
-                time.sleep(5)
-            restore_btn = page.locator('button:has-text("Restore from recovery phrase"):visible')
-
-        if not restore_btn or restore_btn.count() == 0:
-            log("  [wallet] 'Restore from recovery phrase' ga ketemu")
-            return False
-
-        restore_btn.first.click()
-        time.sleep(3)
-
-        # Fill seed phrase
-        ta = page.locator('textarea')
-        if ta.count() > 0:
-            ta.fill(SEED_PHRASE)
-            time.sleep(1)
-            log("  [wallet] seed filled")
-
-        # Fill password
         pw = page.locator('input[type="password"]')
         if pw.count() > 0:
+            log("  [wallet] unlocking...")
             pw.fill(WALLET_PASSWORD)
             time.sleep(1)
-            log("  [wallet] password filled")
-
-        # Click Restore
-        rb = page.locator('button:has-text("Restore"):visible')
-        if rb.count() > 0:
-            rb.first.click()
-            log("  [wallet] klik Restore...")
-            time.sleep(35)  # debug proved 30s works, add buffer
-
-        # Check wallet status on CURRENT page
-        status = check_wallet_status(page)
-        log(f"  [wallet] result (current page): {status}")
-
-        if status != 'connected':
-            # Navigate to stake page and check again
-            page.goto(URL_STAKE, wait_until='load', timeout=30000)
-            time.sleep(10)
-            status = check_wallet_status(page)
-            log(f"  [wallet] result (stake page): {status}")
-
-        return status in ('connected', 'needs_fund')
+            u = page.locator('button:has-text("Unlock"):visible')
+            if u.count() > 0:
+                u.first.click()
+                time.sleep(4)
     except Exception as e:
-        log(f"  [wallet] restore err: {e}")
-        return False
+        log(f"  [wallet] unlock err: {e}")
 
-def check_and_recover_wallet(page):
-    """Kalau wallet tiba-tiba needs_connect, coba restore ulang."""
+def restore_wallet(page):
+    log("  [wallet] clicking Connect wallet...")
+    try:
+        page.locator('button:has-text("Connect wallet"):visible').first.click()
+    except Exception:
+        return False
+    time.sleep(2)
+    r = page.locator('button:has-text("Restore from recovery phrase"):visible')
+    if r.count() == 0:
+        return False
+    r.first.click()
+    time.sleep(2)
+    ta = page.locator('textarea')
+    if ta.count() > 0:
+        ta.fill(SEED_PHRASE)
+        time.sleep(0.5)
+    pw = page.locator('input[type="password"]')
+    if pw.count() > 0:
+        pw.fill(WALLET_PASSWORD)
+        time.sleep(0.5)
+    rb = page.locator('button:has-text("Restore"):visible')
+    if rb.count() > 0:
+        rb.first.click()
+        time.sleep(10)
+    page.goto(URL_STAKE, wait_until='load', timeout=30000)
+    time.sleep(8)
+    return check_wallet_status(page) == 'connected'
+
+def ensure_wallet(page):
     s = check_wallet_status(page)
+    log(f"  [wallet] status: {s}")
     if s == 'connected':
         return True
-    log(f"  [wallet] tiba-tiba {s}, recovery...")
-    return restore_wallet(page)
+    if s == 'needs_unlock':
+        unlock_wallet(page)
+        return check_wallet_status(page) == 'connected'
+    if restore_wallet(page):
+        return True
+    unlock_wallet(page)
+    return check_wallet_status(page) == 'connected'
 
 # ═══════════════════════════════════════════
-# STAKE / UNSTAKE / CLAIM
+# FORM
 # ═══════════════════════════════════════════
 def fill_amount(page, amount):
-    """Fill amount input (React-compatible — use keyboard + dispatch events)."""
     inp = page.locator('input:visible:not([disabled])').first
     if inp.count() == 0:
         return 'none'
-    inp.click()
-    time.sleep(0.3)
-    # Select all and delete
-    page.keyboard.press('Control+a')
-    page.keyboard.press('Backspace')
-    time.sleep(0.3)
-    # Type character by character (triggers React onChange)
-    page.keyboard.type(str(amount), delay=50)
-    time.sleep(2)
-    # Also dispatch input event as fallback
-    try:
-        inp.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles: true})); el.dispatchEvent(new Event('change', {bubbles: true})); }")
-    except Exception:
-        pass
-    time.sleep(1)
+    inp.click(); inp.fill(''); time.sleep(0.3)
+    inp.fill(str(amount)); time.sleep(2)
     return inp.input_value()
 
 def verify_tab(page):
-    """Cek tab aktif (Stake/Unstake)."""
     a = page.locator('button[aria-selected="true"]').first
     return a.inner_text().strip() if a.count() > 0 else 'none'
 
-def click_confirm_sign(page, timeout=30):
-    """Cari & klik 'Confirm & sign' — fallback ke selector lain."""
-    end = time.time() + timeout
-    wait_dom_stable(page, timeout=10)
-    while time.time() < end:
-        # Cara 1: exact text
-        b = page.locator('button:has-text("Confirm & sign"):visible')
-        if b.count() > 0:
-            try:
-                el = b.first
-                dis = el.get_attribute('disabled', timeout=1000)
-                if dis is None:
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    time.sleep(4)
-                    return 'confirmed'
-            except Exception:
-                pass
+def retry_action(fn, tries=3, base_delay=5, label=""):
+    for i in range(tries):
+        if state['stop']:
+            return 'stopped'
+        try:
+            r = fn()
+            if r not in ('failed-3x', 'no-confirm', None):
+                return r
+            log(f"  [retry:{label}] {i+1}/{tries} -> {r}")
+        except Exception as e:
+            log(f"  [retry:{label}] {i+1}/{tries} err: {e}")
+            if 'closed' in str(e).lower() or 'target page' in str(e).lower():
+                return 'browser-dead'
+        if i < tries - 1:
+            wait = base_delay * (2 ** i)
+            log(f"  [retry:{label}] tunggu {wait}s")
+            time.sleep(wait)
+    return 'failed-3x'
 
-        # Cara 2: text contains "Confirm"
-        b2 = page.locator('button:has-text("Confirm"):visible')
-        for i in range(b2.count()):
-            try:
-                el = b2.nth(i)
-                txt = el.inner_text().strip()
-                dis = el.get_attribute('disabled', timeout=1000)
-                if dis is None and 'confirm' in txt.lower():
-                    el.scroll_into_view_if_needed()
-                    el.click()
-                    time.sleep(4)
-                    return 'confirmed'
-            except Exception:
-                pass
-
-        # Cara 3: force click (even if disabled, just try)
-        b3 = page.locator('button:has-text("Confirm & sign"):visible')
-        if b3.count() > 0:
-            try:
-                b3.first.click(force=True, timeout=5000)
-                time.sleep(4)
-                return 'confirmed'
-            except Exception:
-                pass
-
-        if get_tx_hash(page):
-            return 'confirmed'
-        time.sleep(1)
-    return 'no-confirm'
-
-def get_tx_hash(page):
-    """Cek apakah ada tx hash di halaman."""
+# ═══════════════════════════════════════════
+# ACTIONS - FLOW BARU
+# ═══════════════════════════════════════════
+def get_sohm_balance(page):
     try:
-        body = page.inner_text('body') or ''
-        if re.search(r'0x[a-fA-F0-9]{64}', body):
-            return True
+        txt = page.inner_text('body') or ''
+        for pat in (r'(\d+\.?\d*)\s*sDOHM', r'[Bb]alance\s+(\d+\.?\d*)\s*sDOHM'):
+            m = re.search(pat, txt, re.IGNORECASE)
+            if m: return float(m.group(1))
     except Exception:
         pass
-    return False
+    return 0
 
 def do_stake(page, amount=0.2):
-    """Stake DOHM — pakai flex selector."""
+    """
+    Flow: isi amount -> klik "Stake DOHM" -> tunggu "Confirm & Stake" -> klik -> DONE
+    """
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     wait_dom_stable(page, timeout=15)
 
+    if not check_and_recover_wallet(page):
+        log("  [stake] wallet ga bisa recover")
+        return 'failed-3x'
+
     for attempt in range(3):
+        # pastikan tab Stake
         active = verify_tab(page)
         if active != 'Stake':
-            t = find_action_button(page, 'stake', timeout=10)
-            if t:
-                click_button_safe(page, t, "Stake tab")
-            time.sleep(3)
-            active = verify_tab(page)
-        if active != 'Stake':
-            time.sleep(3)
-            continue
-
-        val = fill_amount(page, amount)
-        log(f"  input: '{val}'")
-
-        # Cari submit button khusus "Stake DOHM" (bukan tab "Stake")
-        s = None
-        for sel in [
-            'button:has-text("Stake DOHM"):visible:not([disabled])',
-            'button:has-text("Stake DOHM"):visible',
-        ]:
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                s = loc.first
-                break
-        if not s:
-            # Fallback: scan semua button, cari yang text = "Stake DOHM"
-            all_btns = page.locator('button:visible')
-            for i in range(all_btns.count()):
+            tab = find_action_button(page, 'stake', timeout=10)
+            if tab:
                 try:
-                    txt = all_btns.nth(i).inner_text().strip()
-                    if txt == 'Stake DOHM':
-                        s = all_btns.nth(i)
-                        break
+                    tab.click(); time.sleep(3)
                 except Exception:
                     pass
+            active = verify_tab(page)
+        if active != 'Stake':
+            log(f"  [stake] attempt {attempt+1}: wrong tab '{active}'")
+            time.sleep(3); continue
 
-        if s:
-            r = click_button_safe(page, s, "Stake DOHM")
-            if r == 'disabled':
-                log("  [stake] submit button disabled, skip")
-                return 'disabled'
-            time.sleep(5)  # wait for Confirm & sign modal
-            debug_dump_buttons(page, "after Stake DOHM click")
-            conf = click_confirm_sign(page)
-            log(f"  stake confirm: {conf}")
-            return 'done' if conf == 'confirmed' else conf
+        # isi amount
+        val = fill_amount(page, amount)
+        log(f"  [stake] input: '{val}'")
 
-        debug_dump_buttons(page, "no Stake DOHM submit found")
+        # cari tombol "Stake DOHM" (bukan tab "Stake")
+        log(f"  [stake] attempt {attempt+1}: cari tombol submit...")
+        submit = None
+        for sel in [
+            'button:has-text("Stake DOHM"):visible',
+            'button:has-text("Stake dohm"):visible',
+            'button:has-text("STAKE DOHM"):visible',
+        ]:
+            s = page.locator(sel)
+            for i in range(s.count()):
+                el = s.nth(i)
+                try:
+                    if el.is_visible():
+                        txt = el.inner_text().strip()
+                        if 'unstake' not in txt.lower():
+                            submit = el
+                            break
+                except Exception:
+                    continue
+            if submit: break
+
+        if not submit:
+            log(f"  [stake] attempt {attempt+1}: tombol Stake DOHM ga ketemu")
+            dump_visible_buttons(page, "stake")
+            time.sleep(3); continue
+
+        r = click_button_safe(page, submit, "stake-submit")
+        if r != 'ok':
+            log(f"  [stake] attempt {attempt+1}: click submit gagal ({r})")
+            time.sleep(3); continue
+
+        # tunggu tab konfirmasi "Confirm & Stake"
+        log(f"  [stake] tunggu tab Confirm & Stake...")
+        confirm_btn = wait_confirm_tab(page, mode="stake", timeout=CONFIRM_TAB_TIMEOUT)
+        if not confirm_btn:
+            log(f"  [stake] attempt {attempt+1}: tab Confirm ga muncul")
+            dump_visible_buttons(page, "stake-confirm")
+            time.sleep(3); continue
+
+        # klik "Confirm & Stake"
+        r = click_button_safe(page, confirm_btn, "stake-confirm")
+        if r != 'ok':
+            log(f"  [stake] attempt {attempt+1}: klik Confirm gagal ({r})")
+            time.sleep(3); continue
+
         time.sleep(2)
+
+        # klik DONE
+        click_done_button(page, timeout=DONE_TIMEOUT)
+        log(f"  [stake] ✅ done")
+        return 'done'
 
     return 'failed-3x'
 
 def do_unstake(page, amount=0.1):
-    """Unstake sDOHM — pakai flex selector."""
+    """
+    Flow: pindah tab Unstake -> isi amount -> klik "Unstake DOHM"
+          -> tunggu "Confirm & Sign" -> klik -> DONE
+    """
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     wait_dom_stable(page, timeout=15)
 
-    t = find_action_button(page, 'unstake', timeout=10)
-    if t:
-        click_button_safe(page, t, "Unstake tab")
-    time.sleep(3)
+    if not check_and_recover_wallet(page):
+        return 'failed-3x'
 
+    # pindah ke tab Unstake
     active = verify_tab(page)
     if active != 'Unstake':
-        log(f"  tab ga pindah ke Unstake (masih {active})")
-        return 'tab-fail'
+        tab = find_action_button(page, 'unstake', timeout=10)
+        if tab:
+            try:
+                tab.click(); time.sleep(3)
+            except Exception:
+                pass
 
+    # cek balance
     bal = get_sohm_balance(page)
     if bal <= 0:
-        log(f"  no sDOHM ({bal})")
+        log(f"  [unstake] no sDOHM ({bal})")
         return 'skip'
     amt = amount if amount < bal else round(max(bal - 0.001, 0), 4)
     if amt <= 0:
         return 'skip'
-    log(f"  sDOHM: {bal:.4f}, unstaking: {amt}")
+    log(f"  [unstake] sDOHM: {bal:.4f}, amount: {amt}")
 
-    val = fill_amount(page, amt)
-    log(f"  input: '{val}'")
+    for attempt in range(3):
+        active = verify_tab(page)
+        if active != 'Unstake':
+            tab = find_action_button(page, 'unstake', timeout=10)
+            if tab:
+                try:
+                    tab.click(); time.sleep(3)
+                except Exception:
+                    pass
+            active = verify_tab(page)
+        if active != 'Unstake':
+            log(f"  [unstake] attempt {attempt+1}: wrong tab '{active}'")
+            time.sleep(3); continue
 
-    s = find_action_button(page, 'unstake', timeout=10)
-    if s:
-        r = click_button_safe(page, s, "Unstake DOHM")
-        if r == 'disabled':
-            return 'disabled'
+        val = fill_amount(page, amt)
+        log(f"  [unstake] input: '{val}'")
+
+        # cari tombol "Unstake DOHM"
+        submit = None
+        for sel in [
+            'button:has-text("Unstake DOHM"):visible',
+            'button:has-text("Unstake dohm"):visible',
+            'button:has-text("UNSTAKE DOHM"):visible',
+        ]:
+            s = page.locator(sel)
+            for i in range(s.count()):
+                el = s.nth(i)
+                try:
+                    if el.is_visible():
+                        submit = el
+                        break
+                except Exception:
+                    continue
+            if submit: break
+
+        if not submit:
+            log(f"  [unstake] attempt {attempt+1}: tombol Unstake DOHM ga ketemu")
+            dump_visible_buttons(page, "unstake")
+            time.sleep(3); continue
+
+        r = click_button_safe(page, submit, "unstake-submit")
+        if r != 'ok':
+            log(f"  [unstake] attempt {attempt+1}: click submit gagal ({r})")
+            time.sleep(3); continue
+
+        # tunggu tab konfirmasi "Confirm & Sign"
+        log(f"  [unstake] tunggu tab Confirm & Sign...")
+        confirm_btn = wait_confirm_tab(page, mode="unstake", timeout=CONFIRM_TAB_TIMEOUT)
+        if not confirm_btn:
+            log(f"  [unstake] attempt {attempt+1}: tab Confirm ga muncul")
+            dump_visible_buttons(page, "unstake-confirm")
+            time.sleep(3); continue
+
+        r = click_button_safe(page, confirm_btn, "unstake-confirm")
+        if r != 'ok':
+            log(f"  [unstake] attempt {attempt+1}: klik Confirm gagal ({r})")
+            time.sleep(3); continue
+
         time.sleep(2)
-        conf = click_confirm_sign(page)
-        log(f"  unstake confirm: {conf}")
-        return 'done' if conf == 'confirmed' else conf
 
-    debug_dump_buttons(page, "unstake failed")
-    return 'failed'
+        # klik DONE
+        click_done_button(page, timeout=DONE_TIMEOUT)
+        log(f"  [unstake] ✅ done")
+        return 'done'
 
-def get_sohm_balance(page):
-    """Baca sDOHM balance."""
-    try:
-        body = page.inner_text('body') or ''
-        # Look for sDOHM balance patterns
-        m = re.search(r'([\d,.]+)\s*sDOHM', body)
-        if m:
-            return float(m.group(1).replace(',', ''))
-        m = re.search(r'Available[:\s]*([\d,.]+)', body)
-        if m:
-            return float(m.group(1).replace(',', ''))
-    except Exception:
-        pass
-    return 0
+    return 'failed-3x'
 
 def do_claim(page):
-    """Claim semua matured bonds — FIRE & FORGET."""
-    page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
-    for _ in range(20):
-        time.sleep(1)
-        if page.locator('button:has-text("Claim"):visible').count() > 0:
-            break
-    time.sleep(2)
+    """
+    Flow: klik semua tombol Claim (fire & forget).
+    Ga tunggu settle. Pending di mempool dibiarkan.
+    """
+    try:
+        page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
+        wait_dom_stable(page, timeout=10)
+    except Exception as e:
+        log(f"  [claim] goto err: {e}")
+        return 'skip'
+
+    if not check_and_recover_wallet(page):
+        return 'failed-3x'
 
     total = 0
-    # Klik semua claim buttons SECEPAT MUNGKIN
-    for rnd in range(10):
-        n = page.locator('button:has-text("Claim"):not([disabled]):visible').count()
-        if n == 0:
+    for rnd in range(5):
+        btn = find_action_button(page, 'claim', timeout=5)
+        if not btn:
             break
-        log(f"  [claim] round {rnd + 1}: {n} tombol")
-        for _ in range(n):
-            b = page.locator('button:has-text("Claim"):not([disabled]):visible').first
-            if b.count() == 0:
+
+        log(f"  [claim] round {rnd+1}: ketemu tombol claim")
+
+        clicked_this_round = 0
+        for _ in range(5):
+            b = find_action_button(page, 'claim', timeout=3)
+            if not b:
                 break
-            try:
-                b.scroll_into_view_if_needed()
-                b.click()
-                total += 1
-                log(f"  [claim] bond #{total} clicked")
-                time.sleep(2)
-            except Exception as e:
-                log(f"  [claim] err: {e}")
+            r = click_button_safe(page, b, f"claim-{total+1}")
+            if r != 'ok':
                 break
-        # Reload buat cari claim buttons baru
+            total += 1
+            clicked_this_round += 1
+            log(f"  [claim] bond #{total} clicked (NO WAIT)")
+            time.sleep(2)
+
+            # kadang muncul confirm/DONE setelah klik claim
+            # cek sebentar, klik kalau ada
+            confirm_btn = wait_confirm_tab(page, mode="unstake", timeout=3)
+            if confirm_btn:
+                click_button_safe(page, confirm_btn, "claim-confirm")
+                time.sleep(1)
+                click_done_button(page, timeout=3)
+
+        if clicked_this_round == 0:
+            break
+
+        # cek apakah masih ada claim button (round berikutnya)
+        if not find_action_button(page, 'claim', timeout=2):
+            break
+
         try:
             page.reload(wait_until='load', timeout=30000)
-            time.sleep(3)
+            time.sleep(5)
         except Exception:
             break
 
-    log(f"  [claim] total: {total}")
+    log(f"  [claim] total: {total} (fire & forget)")
     return 'done' if total > 0 else 'skip'
-
-# ═══════════════════════════════════════════
-# POINTS
-# ═══════════════════════════════════════════
-def get_points(page):
-    """Baca points dari halaman."""
-    try:
-        body = page.inner_text('body') or ''
-        m = re.search(r'([\d,]+\.?\d*)\s*pts', body, re.IGNORECASE)
-        if m:
-            return float(m.group(1).replace(',', ''))
-    except Exception:
-        pass
-    return 0
 
 # ═══════════════════════════════════════════
 # FAUCET
 # ═══════════════════════════════════════════
-def _find_visible(page, selectors):
-    """Cari element visible dari list selectors."""
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            for i in range(loc.count()):
-                el = loc.nth(i)
-                if el.is_visible():
-                    return el
-        except Exception:
-            pass
-    return None
-
 def try_claim_faucet(page):
-    """Coba claim faucet BTC/frBTC."""
     try:
-        log("  [faucet] buka setup page")
+        log(f"[FAUCET] buka {URL_SETUP}")
         page.goto(URL_SETUP, wait_until='load', timeout=30000)
         for _ in range(15):
             time.sleep(2)
@@ -683,300 +794,259 @@ def try_claim_faucet(page):
                     break
             except Exception:
                 pass
+        ensure_wallet(page)
+        time.sleep(2)
 
-        # Cari menu Link
-        link_menu = _find_visible(page, [
-            'a:has-text("Link")', 'button:has-text("Link")',
-            '[role="tab"]:has-text("Link")', 'text="Link"',
-        ])
+        link_menu = None
+        for sel in ['a:has-text("Link")', 'button:has-text("Link")', 'text="Link"']:
+            loc = page.locator(sel)
+            for i in range(loc.count()):
+                if loc.nth(i).is_visible():
+                    link_menu = loc.nth(i)
+                    break
+            if link_menu: break
+
         if not link_menu:
-            log("  [faucet] menu Link ga ketemu")
+            log("[FAUCET] menu 'Link' ga ketemu")
             return 'not-available'
-        log("  [faucet] klik Link")
-        try:
-            link_menu.scroll_into_view_if_needed()
-            link_menu.click()
-        except Exception as e:
-            log(f"  [faucet] klik Link err: {e}")
-            return 'error'
+        log("[FAUCET] klik menu Link")
+        link_menu.click()
         time.sleep(3)
 
-        # Klik wallet Linked
-        wl = _find_visible(page, [
-            'button:has-text("wallet Linked")', 'button:has-text("Wallet Linked")',
-            'button:has-text("Linked")', 'text=/Linked/i',
-        ])
+        wl = None
+        for sel in ['button:has-text("wallet Linked")', 'button:has-text("Wallet Linked")', 'text=/wallet\\s+Linked/i']:
+            loc = page.locator(sel)
+            for i in range(loc.count()):
+                if loc.nth(i).is_visible():
+                    wl = loc.nth(i)
+                    break
+            if wl: break
+
         if wl:
-            log("  [faucet] klik wallet Linked")
-            try:
-                wl.scroll_into_view_if_needed()
-                wl.click()
-                time.sleep(3)
-            except Exception as e:
-                log(f"  [faucet] err: {e}")
-        else:
-            log("  [faucet] wallet Linked ga ketemu (lanjut)")
+            log("[FAUCET] klik 'wallet Linked'")
+            wl.click()
+            time.sleep(3)
 
-        # Continue
-        cont = _find_visible(page, [
-            'button:has-text("Continue")', 'button:has-text("CONTINUE")',
-        ])
+        cont = None
+        for sel in ['button:has-text("Continue")', 'button:has-text("CONTINUE")']:
+            loc = page.locator(sel)
+            for i in range(loc.count()):
+                if loc.nth(i).is_visible():
+                    cont = loc.nth(i)
+                    break
+            if cont: break
+
         if cont:
-            log("  [faucet] klik Continue")
-            try:
-                cont.scroll_into_view_if_needed()
-                cont.click()
-                time.sleep(4)
-            except Exception as e:
-                log(f"  [faucet] err: {e}")
-        else:
-            log("  [faucet] Continue ga ketemu (lanjut)")
+            log("[FAUCET] klik Continue")
+            cont.click()
+            time.sleep(4)
 
         time.sleep(3)
+        claimed = False
 
-        # Get BTC
-        btc = _find_visible(page, [
-            'button:has-text("Get BTC")', 'button:has-text("GET BTC")',
-        ])
-        if btc:
-            try:
-                dis = btc.get_attribute('disabled', timeout=1000)
-                if dis is not None:
-                    log("  [faucet] 'Get BTC' disabled")
-                else:
-                    btc.scroll_into_view_if_needed()
-                    btc.click()
-                    log("  [faucet] Get BTC clicked")
-                    time.sleep(5)
-            except Exception as e:
-                log(f"  [faucet] Get BTC err: {e}")
-        else:
-            log("  [faucet] Get BTC ga ketemu")
+        for label, sel in [("Get BTC", 'button:has-text("Get BTC")'), ("Get frBTC", 'button:has-text("Get frBTC")')]:
+            btn = page.locator(sel)
+            if btn.count() > 0 and btn.first.is_visible():
+                log(f"[FAUCET] klik {label}")
+                try:
+                    btn.first.scroll_into_view_if_needed()
+                    btn.first.click()
+                    time.sleep(3)
+                    # tunggu confirm tab
+                    confirm_btn = wait_confirm_tab(page, mode="stake", timeout=15)
+                    if confirm_btn:
+                        click_button_safe(page, confirm_btn, "faucet-confirm")
+                        time.sleep(2)
+                        click_done_button(page, timeout=5)
+                        claimed = True
+                    elif get_tx_hash(page):
+                        claimed = True
+                    time.sleep(3)
+                except Exception as e:
+                    log(f"[FAUCET] {label} err: {e}")
 
-        # Get frBTC
-        frbtc = _find_visible(page, [
-            'button:has-text("Get frBTC")', 'button:has-text("GET frBTC")',
-        ])
-        if frbtc:
-            try:
-                dis = frbtc.get_attribute('disabled', timeout=1000)
-                if dis is not None:
-                    log("  [faucet] 'Get frBTC' disabled")
-                else:
-                    frbtc.scroll_into_view_if_needed()
-                    frbtc.click()
-                    log("  [faucet] Get frBTC clicked")
-                    time.sleep(5)
-            except Exception as e:
-                log(f"  [faucet] Get frBTC err: {e}")
-        else:
-            log("  [faucet] Get frBTC ga ketemu")
-
-        # Check cooldown
-        body = page.inner_text('body') or ''
-        if re.search(r'cooldown|try again later|already claimed', body, re.IGNORECASE):
-            log("  [faucet] cooldown")
-            return 'cooldown'
-
-        return 'claimed'
+        return 'claimed' if claimed else 'not-available'
     except Exception as e:
-        log(f"  [faucet] err: {e}")
+        log(f"[FAUCET] exception: {e}")
         return 'error'
 
 # ═══════════════════════════════════════════
-# RETRY HELPER
+# MAIN LOOP
 # ═══════════════════════════════════════════
-def retry_action(fn, tries=3, base_delay=5, label=""):
-    """Retry action dengan exponential backoff."""
-    for i in range(tries):
-        if state['stop']:
-            return 'stopped'
-        try:
-            r = fn()
-            if r not in ('failed-3x', 'no-confirm', None):
-                return r
-        except Exception as e:
-            log(f"  [retry:{label}] {i+1}/{tries} err: {e}")
-        if i < tries - 1:
-            delay = base_delay * (2 ** i) + random.uniform(0, 3)
-            log(f"  [retry:{label}] {i+1}/{tries} -> retry in {delay:.0f}s")
-            time.sleep(delay)
-    return 'failed-3x'
+def run_session():
+    global start_time
+    start_time = time.time()
 
-def sleep_fixed(min_s, max_s, label=""):
-    """Sleep with random duration."""
-    d = random.uniform(min_s, max_s)
-    log(f"  [jeda] {label}: {d:.0f}s")
-    time.sleep(d)
+    log(f"[INIT] DOHM Farm v21 FAST FLOW | {datetime.now()}")
+    log(f"[INIT] Target: {POINTS_TARGET} pts | Jeda: {JEDA_MIN}-{JEDA_MAX}s")
+    notify(f"🚀 <b>DOHM Farm v21 FAST</b>\nTarget: {POINTS_TARGET} pts")
 
-# ═══════════════════════════════════════════
-# FARMING SESSION
-# ═══════════════════════════════════════════
-def run_farming_session():
-    """Main farming loop — sequential, no threads."""
+    state['stop'] = False
+    state['target_reached'] = False
+    state['wallet_ok'] = False
+    state['current_cycle'] = 0
+    state['stake_fail_streak'] = 0
+    state['claim_count'] = 0
+
     with Camoufox(headless=True) as browser:
         page = browser.new_page()
 
+        log("[INIT] buka halaman stake...")
         page.goto(URL_STAKE, wait_until='load', timeout=30000)
         time.sleep(5)
 
-        # Restore wallet
-        if not restore_wallet(page):
-            log("[FATAL] Wallet restore gagal!")
-            notify("❌ Wallet restore gagal!")
-            return False
+        log("[INIT] ensure wallet...")
+        state['wallet_ok'] = ensure_wallet(page)
+        if not state['wallet_ok']:
+            log("[INIT] WARNING: wallet ga connect")
+            notify("⚠️ <b>Wallet gagal connect</b>")
 
-        # Baca points awal
-        time.sleep(5)
-        pts = get_points(page)
-        state['initial_points'] = pts
-        state['last_notify_pts'] = pts
-        log(f"[INIT] Points awal: {pts:.2f}")
-        notify(f"🚀 <b>DOHM Farm v19-start</b>\nPoints: {pts:.2f}")
+        state['initial_points'] = get_points(page)
+        state['last_notify_pts'] = state['initial_points']
+        log(f"[INIT] Points awal: {state['initial_points']:.2f}")
 
-        next_faucet_time = time.time()
-        faucet_result = None
-        cycle_num = 0
+        next_faucet_check = time.time() + random.uniform(30, 120)
 
-        while not state['stop']:
-            cycle_num += 1
-            state['current_cycle'] = cycle_num
+        cycle = 0
+        while not state['stop'] and not state['target_reached']:
+            cycle += 1
+            state['current_cycle'] = cycle
+            if MAX_CYCLES > 0 and cycle > MAX_CYCLES:
+                log(f"[END] max cycles {MAX_CYCLES}")
+                break
 
-            # Auto-restart setiap 200 cycles (anti OOM)
-            RESTART_EVERY = 200
-            if cycle_num > 1 and cycle_num % RESTART_EVERY == 0:
-                log(f"[RESTART] {cycle_num} cycles, restart...")
-                notify(f"🔄 Auto-restart setelah {cycle_num} cycles")
-                return False
+            log(f"\n{'='*60}")
+            log(f"CYCLE {cycle} | {datetime.now().strftime('%H:%M:%S')}")
+            log(f"{'='*60}")
 
-            log(f"\n{'='*50}")
-            log(f"CYCLE {cycle_num} | {datetime.now().strftime('%H:%M:%S')}")
-            log(f"{'='*50}")
-
-            # Wallet recovery check
-            check_and_recover_wallet(page)
+            # cek page hidup
+            try:
+                if page.is_closed():
+                    log("[INIT] ⚠️ page closed, break")
+                    break
+            except Exception:
+                log("[INIT] ⚠️ page error, break")
+                break
 
             pts = get_points(page)
-            heartbeat(f"cycle={cycle_num} pts={pts:.2f}")
+            heartbeat(f"cycle={cycle} pts={pts:.2f}")
 
-            # Cek target
-            if pts >= POINTS_TARGET:
-                msg = f"🎯 TARGET! {pts:.2f} / {POINTS_TARGET}"
-                log(msg)
-                notify(msg)
-                state['stop'] = True
-                return True
-
-            # Notif tiap N pts
+            # notif
             if pts - state['last_notify_pts'] >= NOTIFY_EVERY_PTS:
                 gained = pts - state['initial_points']
-                notify(f"📈 <b>{pts:.2f} pts</b> (+{gained:.2f})\nCycle: {cycle_num}")
+                notify(f"📈 <b>+{int(pts - state['last_notify_pts'])} pts</b>\n"
+                       f"Total: <b>{pts:.2f}</b> / {POINTS_TARGET}\n"
+                       f"Progress: {pts/POINTS_TARGET*100:.1f}%\n"
+                       f"Cycle: {cycle}\n"
+                       f"Claim done: {state['claim_count']}\n"
+                       f"Gained: {gained:+.2f} pts")
                 state['last_notify_pts'] = pts
+
+            if pts >= POINTS_TARGET:
+                notify(f"🎯 <b>TARGET TERCAPAI!</b>\nPoints: <b>{pts:.2f}</b>")
+                state['target_reached'] = True
+                break
 
             log(f"  pts: {pts:.2f}")
 
-            # ── FAUCET ──
-            if FAUCET_ENABLED and time.time() >= next_faucet_time:
-                log("  [faucet] checking...")
-                faucet_result = retry_action(lambda: try_claim_faucet(page), tries=2, label="faucet")
-                log(f"  [faucet] result: {faucet_result}")
-                if faucet_result in ('claimed', 'cooldown'):
-                    delay_hours = random.uniform(FAUCET_MIN_HOURS, FAUCET_MAX_HOURS)
-                    next_faucet_time = time.time() + delay_hours * 3600
-                    log(f"  [faucet] next check in {delay_hours:.1f}h")
-                elif faucet_result == 'not-available':
-                    next_faucet_time = time.time() + 3600
+            # faucet
+            if FAUCET_ENABLED and time.time() >= next_faucet_check:
+                log("[FAUCET] waktunya cek faucet")
+                res = try_claim_faucet(page)
+                log(f"[FAUCET] result: {res}")
+                if res == 'claimed':
+                    notify("💧 <b>Faucet claimed!</b>")
+                    next_faucet_check = time.time() + random.uniform(FAUCET_MIN_HOURS*3600, FAUCET_MAX_HOURS*3600)
+                elif res == 'cooldown':
+                    next_faucet_check = time.time() + 2*3600
+                elif res == 'not-available':
+                    next_faucet_check = time.time() + 3*3600
                 else:
-                    next_faucet_time = time.time() + 1800
-                page.goto(URL_STAKE, wait_until='load', timeout=30000)
-                time.sleep(3)
-
-            # ── SKIP IF WALLET NEEDS FUND ──
-            ws = check_wallet_status(page)
-            if ws in ('needs_fund', 'needs_connect'):
-                log(f"  [SKIP] Wallet {ws}")
-                time.sleep(30)
-                continue
-
-            # ════════════════════════════════════════
-            # SEQ: Stake → jeda → Unstake → jeda → Claim
-            # ════════════════════════════════════════
+                    next_faucet_check = time.time() + 3600
+                try:
+                    page.goto(URL_STAKE, wait_until='load', timeout=30000)
+                    time.sleep(3)
+                except Exception:
+                    pass
 
             # ── STAKE ──
-            log(f"  [SEQ 1/3] Stake {STAKE_AMOUNT} DOHM...")
+            log(f"  [1/3] Stake {STAKE_AMOUNT} DOHM...")
             r1 = retry_action(lambda: do_stake(page, STAKE_AMOUNT), tries=3, label="stake")
             log(f"  -> {r1}")
-            if r1 == 'disabled':
-                log("  [!] Stake disabled, skip cycle")
-                time.sleep(30)
-                continue
+            if r1 == 'browser-dead':
+                log("[SEQ] browser mati, exit")
+                break
             if r1 != 'done':
-                log(f"  [!] stake gagal ({r1}), skip")
-                notify(f"⚠️ Stake gagal cycle {cycle_num}: {r1}")
-                time.sleep(60)
+                state['stake_fail_streak'] += 1
+                wait_extra = min(30 * state['stake_fail_streak'], 180)
+                log(f"  [!] stake gagal ({r1}), streak={state['stake_fail_streak']}, tunggu {wait_extra}s")
+                try:
+                    page.goto(URL_STAKE, wait_until='load', timeout=30000)
+                    time.sleep(3)
+                except Exception:
+                    pass
+                time.sleep(wait_extra)
                 continue
+            state['stake_fail_streak'] = 0
 
-            sleep_fixed(JEDA_MIN, JEDA_MAX, "stake→unstake")
+            sleep_fixed(JEDA_MIN, JEDA_MAX, "setelah stake")
 
             # ── UNSTAKE ──
-            log(f"  [SEQ 2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
+            log(f"  [2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
             r2 = retry_action(lambda: do_unstake(page, UNSTAKE_AMOUNT), tries=3, label="unstake")
             log(f"  -> {r2}")
+            if r2 == 'browser-dead':
+                break
+            if r2 == 'skip':
+                log(f"  no sDOHM, langsung claim")
 
-            sleep_fixed(JEDA_MIN, JEDA_MAX, "unstake→claim")
+            sleep_fixed(JEDA_MIN, JEDA_MAX, "setelah unstake")
 
-            # ── CLAIM ──
-            log("  [SEQ 3/3] Claim...")
+            # ── CLAIM (fire & forget) ──
+            log(f"  [3/3] Claim (fire & forget)...")
             r3 = retry_action(lambda: do_claim(page), tries=2, label="claim")
             log(f"  -> {r3}")
+            if r3 == 'browser-dead':
+                break
+            if r3 == 'done':
+                state['claim_count'] += 1
 
-            # Hitung cycle time
-            sleep_fixed(JEDA_MIN, JEDA_MAX, "cycle end")
+            pts_now = get_points(page)
+            log(f"  cycle {cycle} done. pts={pts_now:.2f} → next cycle")
 
-    return False  # supervisor will restart
+        log("[END] session selesai")
 
 # ═══════════════════════════════════════════
 # SUPERVISOR
 # ═══════════════════════════════════════════
-def main():
-    """Supervisor — auto-restart on crash."""
-    # Lock file
-    try:
-        lock_fd = open(LOCK_FILE, 'w')
-        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
-        print("[LOCK] Script lain masih jalan. Exit.")
+if __name__ == '__main__':
+    lock = acquire_lock()
+    if not lock:
         sys.exit(1)
 
-    log("=" * 50)
-    log(f"DOHM Farm v19-fix | {datetime.now()}")
-    log(f"Target: {POINTS_TARGET} | Mode: {'infinite' if MAX_CYCLES == 0 else MAX_CYCLES}")
-    log("=" * 50)
-    notify(f"🚀 <b>DOHM Farm v19-fix start</b>\nTarget: {POINTS_TARGET}")
-
     restart_count = 0
-    while not state['stop']:
+    while True:
         try:
-            run_farming_session()
+            run_session()
+            if state['target_reached']:
+                log("[SUPERVISOR] Target reached. Exit.")
+                notify("✅ <b>DOHM Farm selesai</b>")
+                break
+            else:
+                log("[SUPERVISOR] Session ended, restart in 30s...")
+                time.sleep(30)
         except KeyboardInterrupt:
-            log("[EXIT] Manual stop")
+            log("[SUPERVISOR] Ctrl+C, exit.")
             state['stop'] = True
             break
         except Exception as e:
-            log(f"[CRASH] {e}")
-            log(traceback.format_exc())
-            notify(f"⚠️ Crash: {e}")
             restart_count += 1
-            delay = min(300, 15 * restart_count)
-            log(f"[RESTART] Restart #{restart_count} in {delay}s...")
-            time.sleep(delay)
-
-    log("[END] Farming selesai")
-    notify("✅ Farming selesai")
-    try:
-        lock_fd.close()
-    except Exception:
-        pass
-
-if __name__ == '__main__':
-    main()
+            log(f"[SUPERVISOR] CRASH #{restart_count}: {e}")
+            log(traceback.format_exc())
+            notify(f"🔴 <b>Crash #{restart_count}</b>\n<code>{str(e)[:200]}</code>")
+            state['stop'] = True
+            time.sleep(5)
+            backoff = min(30 * restart_count, 300)
+            log(f"[SUPERVISOR] Restart in {backoff}s...")
+            time.sleep(backoff)
+    log("[SUPERVISOR] Exiting.")
