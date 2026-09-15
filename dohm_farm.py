@@ -569,17 +569,49 @@ def verify_tab(page):
     return a.inner_text().strip() if a.count() > 0 else 'none'
 
 def click_confirm_sign(page, timeout=30):
+    """Cari & klik 'Confirm & sign' — fallback ke selector lain."""
     end = time.time() + timeout
+    wait_dom_stable(page, timeout=10)
     while time.time() < end:
-        b = page.locator('button:has-text("Confirm & sign"):not([disabled]):visible')
+        # Cara 1: exact text
+        b = page.locator('button:has-text("Confirm & sign"):visible')
         if b.count() > 0:
             try:
-                b.first.scroll_into_view_if_needed()
-                b.first.click()
+                el = b.first
+                dis = el.get_attribute('disabled', timeout=1000)
+                if dis is None:
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    time.sleep(4)
+                    return 'confirmed'
+            except Exception:
+                pass
+
+        # Cara 2: text contains "Confirm"
+        b2 = page.locator('button:has-text("Confirm"):visible')
+        for i in range(b2.count()):
+            try:
+                el = b2.nth(i)
+                txt = el.inner_text().strip()
+                dis = el.get_attribute('disabled', timeout=1000)
+                if dis is None and 'confirm' in txt.lower():
+                    el.scroll_into_view_if_needed()
+                    el.click()
+                    time.sleep(4)
+                    return 'confirmed'
+            except Exception:
+                pass
+
+        # Cara 3: force click (even if disabled, just try)
+        b3 = page.locator('button:has-text("Confirm & sign"):visible')
+        if b3.count() > 0:
+            try:
+                b3.first.click(force=True, timeout=5000)
                 time.sleep(4)
                 return 'confirmed'
             except Exception:
                 pass
+
         if get_tx_hash(page):
             return 'confirmed'
         time.sleep(1)
