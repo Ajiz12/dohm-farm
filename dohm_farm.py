@@ -365,29 +365,22 @@ def click_done_button(page, timeout=10):
 
 def wait_confirm_tab(page, mode="stake", timeout=None):
     """
-    Tunggu tab konfirmasi muncul.
-    mode: 'stake' → "Confirm & Stake"
-          'unstake' → "Confirm & Sign"
+    Tunggu tombol konfirmasi muncul.
+    DOHM pake "Confirm & sign" untuk stake DAN unstake.
     """
     if timeout is None:
         timeout = CONFIRM_TAB_TIMEOUT
 
-    if mode == "stake":
-        patterns = [
-            'button:has-text("Confirm & Stake")',
-            'button:has-text("Confirm & stake")',
-            'button:has-text("Confirm and Stake")',
-            'button:has-text("Confirm Stake")',
-            'button:has-text("CONFIRM & STAKE")',
-        ]
-    else:  # unstake
-        patterns = [
-            'button:has-text("Confirm & Sign")',
-            'button:has-text("Confirm & sign")',
-            'button:has-text("Confirm and Sign")',
-            'button:has-text("Confirm Sign")',
-            'button:has-text("CONFIRM & SIGN")',
-        ]
+    patterns = [
+        'button:has-text("Confirm & sign")',
+        'button:has-text("Confirm & Sign")',
+        'button:has-text("Confirm & Stake")',
+        'button:has-text("Confirm & stake")',
+        'button:has-text("Confirm and Sign")',
+        'button:has-text("Confirm and Stake")',
+        'button:has-text("CONFIRM & SIGN")',
+        'button:has-text("CONFIRM & STAKE")',
+    ]
 
     end = time.time() + timeout
     while time.time() < end:
