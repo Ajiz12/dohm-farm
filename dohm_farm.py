@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import traceback
 import threading
+import json
 import urllib.request
 import urllib.parse
 from datetime import datetime
@@ -32,8 +33,10 @@ if not WALLET_PASSWORD or not SEED_PHRASE:
 
 POINTS_TARGET = float(os.environ.get('POINTS_TARGET', '25000'))
 MAX_CYCLES    = int(os.environ.get('MAX_CYCLES', '0'))
-STAKE_AMOUNT  = float(os.environ.get('STAKE_AMOUNT', '0.2'))
-UNSTAKE_AMOUNT= float(os.environ.get('UNSTAKE_AMOUNT', '0.1'))
+STAKE_MIN = float(os.environ.get('STAKE_MIN', '0.03'))
+STAKE_MAX = float(os.environ.get('STAKE_MAX', '0.2'))
+UNSTAKE_MIN = float(os.environ.get('UNSTAKE_MIN', '0.03'))
+UNSTAKE_MAX = float(os.environ.get('UNSTAKE_MAX', '0.1'))
 
 JEDA_MIN = int(os.environ.get('JEDA_MIN', '5'))
 JEDA_MAX = int(os.environ.get('JEDA_MAX', '15'))
@@ -157,6 +160,12 @@ def acquire_lock():
 # ═══════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════
+def random_amount(min_amt, max_amt, decimals=4):
+    """Generate amount random antara min dan max."""
+    if max_amt < min_amt:
+        min_amt, max_amt = max_amt, min_amt
+    return round(random.uniform(min_amt, max_amt), decimals)
+
 def sleep_fixed(min_s=5, max_s=15, label=""):
     total = random.uniform(min_s, max_s)
     log(f"  [jeda] {label}: {total:.1f}s")
@@ -177,10 +186,11 @@ def get_tx_hash(page):
 def read_points_no_nav(page):
     try:
         txt = page.inner_text('body') or ''
-        for pat in (r'(\d+\.?\d*)\s*pts', r'[Pp]oints?\s*[:=]?\s*(\d+\.?\d*)'):
+        for pat in (r'(\d[\d,.]*)\s*pts',):
             m = re.search(pat, txt, re.IGNORECASE)
             if m:
-                return float(m.group(1))
+                val = m.group(1).replace(',', '')
+                return float(val)
     except Exception:
         pass
     return None
@@ -400,6 +410,65 @@ def wait_confirm_tab(page, mode="stake", timeout=None):
     log(f"  [confirm-tab] mode={mode}: ga ketemu dalam {timeout}s")
     return None
 
+def scan_claim_buttons(page):
+    """Scan tombol Claim via text-node walker, baca amount sDOHM/DOHM dari parent.
+    Urut dari TERBESAR. Klik 1 per transaction — tunggu settle (DONE) baru lanjut."""
+    results = []
+    try:
+        raw = page.evaluate("""
+            () => {
+                const out = [];
+                const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+                let found = 0;
+                while (walker.nextNode() && found < 20) {
+                    const node = walker.currentNode;
+                    if ((node.nodeValue || '').trim() !== 'Claim') continue;
+                    let p = node.parentElement;
+                    for (let i = 0; i < 10 && p; i++) {
+                        if (p.innerText && /sDOHM|DOHM/i.test(p.innerText)) break;
+                        p = p.parentElement;
+                    }
+                    if (!p) continue;
+                    out.push({
+                        amount: 0,
+                        ctx: p.innerText.replace(/\\n/g, ' | ').substring(0, 150)
+                    });
+                    found++;
+                }
+                return JSON.stringify(out);
+            }
+        """)
+        data = json.loads(raw)
+    except Exception as e:
+        log(f"  [claim-scan] err: {e}")
+        return results
+
+    # rebuild with locator + amount
+    for item in data:
+        ctx = item.get('ctx', '')
+        m = re.search(r'(\d+\.?\d*)\s*sDOHM', ctx, re.IGNORECASE)
+        if m:
+            amount = float(m.group(1))
+        else:
+            m = re.search(r'(\d+\.?\d*)\s*DOHM', ctx, re.IGNORECASE)
+            if m and 'sDOHM' not in ctx.lower():
+                amount = float(m.group(1))
+            else:
+                amount = 0.0
+        results.append({
+            'amount': amount,
+            'text': ctx[:80],
+        })
+
+    results.sort(key=lambda x: x['amount'], reverse=True)
+
+    if results:
+        log(f"  [claim-scan] {len(results)} claim buttons (urut terbesar):")
+        for r in results[:5]:
+            log(f"    - amount={r['amount']:.6f} | {r['text'][:60]}")
+
+    return results
+
 def check_and_recover_wallet(page):
     s = check_wallet_status(page)
     if s == 'connected':
@@ -542,10 +611,11 @@ def get_sohm_balance(page):
         pass
     return 0
 
-def do_stake(page, amount=0.2):
-    """
-    Flow: isi amount -> klik "Stake DOHM" -> tunggu "Confirm & Stake" -> klik -> DONE
-    """
+def do_stake(page, amount=None):
+    """Flow: isi amount -> klik "Stake DOHM" -> Confirm & Stake -> DONE."""
+    if amount is None:
+        amount = random_amount(STAKE_MIN, STAKE_MAX)
+    log(f"  [stake] amount: {amount}")
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     wait_dom_stable(page, timeout=15)
 
@@ -626,11 +696,11 @@ def do_stake(page, amount=0.2):
 
     return 'failed-3x'
 
-def do_unstake(page, amount=0.1):
-    """
-    Flow: pindah tab Unstake -> isi amount -> klik "Unstake DOHM"
-          -> tunggu "Confirm & Sign" -> klik -> DONE
-    """
+def do_unstake(page, amount=None):
+    """Flow: tab Unstake -> isi amount -> Unstake DOHM -> Confirm & Sign -> DONE."""
+    if amount is None:
+        amount = random_amount(UNSTAKE_MIN, UNSTAKE_MAX)
+    log(f"  [unstake] amount: {amount}")
     page.goto(URL_STAKE, wait_until='load', timeout=30000)
     wait_dom_stable(page, timeout=15)
 
@@ -726,8 +796,8 @@ def do_unstake(page, amount=0.1):
 
 def do_claim(page):
     """
-    Flow: klik semua tombol Claim (fire & forget).
-    Ga tunggu settle. Pending di mempool dibiarkan.
+    Claim sequensial: claim bond sDOHM/DOHM TERBESAR dulu,
+    tunggu tx settle (DONE/pending hilang), baru claim berikutnya.
     """
     try:
         page.goto(URL_PORTFOLIO, wait_until='load', timeout=30000)
@@ -741,47 +811,59 @@ def do_claim(page):
 
     total = 0
     for rnd in range(5):
+        # scan semua tombol claim, urut dari TERBESAR
+        buttons = scan_claim_buttons(page)
+        if not buttons:
+            break
+
+        # ambil TERTINGGI saja (index 0)
+        target = buttons[0]
+        log(f"  [claim] bond #1 (largest) amount={target['amount']:.6f} — {target['text'][:50]}")
+
+        # cari & klik tombol claim
         btn = find_action_button(page, 'claim', timeout=5)
         if not btn:
             break
+        r = click_button_safe(page, btn, f"claim-{target['amount']:.4f}")
+        if r != 'ok':
+            break
+        total += 1
+        log(f"  [claim] bond #{total} clicked")
 
-        log(f"  [claim] round {rnd+1}: ketemu tombol claim")
-
-        clicked_this_round = 0
-        for _ in range(5):
-            b = find_action_button(page, 'claim', timeout=3)
-            if not b:
-                break
-            r = click_button_safe(page, b, f"claim-{total+1}")
-            if r != 'ok':
-                break
-            total += 1
-            clicked_this_round += 1
-            log(f"  [claim] bond #{total} clicked (NO WAIT)")
+        # tunggu confirm tab muncul, klik
+        confirm_btn = wait_confirm_tab(page, mode="unstake", timeout=CONFIRM_TAB_TIMEOUT)
+        if confirm_btn:
+            click_button_safe(page, confirm_btn, "claim-confirm")
             time.sleep(2)
+            click_done_button(page, timeout=DONE_TIMEOUT)
 
-            # kadang muncul confirm/DONE setelah klik claim
-            # cek sebentar, klik kalau ada
-            confirm_btn = wait_confirm_tab(page, mode="unstake", timeout=3)
-            if confirm_btn:
-                click_button_safe(page, confirm_btn, "claim-confirm")
-                time.sleep(1)
-                click_done_button(page, timeout=3)
+        # tunggu tx settle — pending/mempool hilang
+        log(f"  [claim] waiting for tx settle...")
+        settled = False
+        for _ in range(10):
+            time.sleep(5)
+            try:
+                body = page.inner_text('body') or ''
+            except Exception:
+                break
+            if 'in mempool' not in body.lower():
+                settled = True
+                break
+        if not settled:
+            log(f"  [claim] tx still pending, continuing")
+            time.sleep(10)
 
-        if clicked_this_round == 0:
-            break
-
-        # cek apakah masih ada claim button (round berikutnya)
-        if not find_action_button(page, 'claim', timeout=2):
-            break
-
+        # reload & cek lagi
         try:
             page.reload(wait_until='load', timeout=30000)
             time.sleep(5)
         except Exception:
             break
 
-    log(f"  [claim] total: {total} (fire & forget)")
+        if not find_action_button(page, 'claim', timeout=2):
+            break
+
+    log(f"  [claim] total: {total} (sequensial, tunggu settle)")
     return 'done' if total > 0 else 'skip'
 
 # ═══════════════════════════════════════════
@@ -974,8 +1056,8 @@ def run_session():
                     pass
 
             # ── STAKE ──
-            log(f"  [1/3] Stake {STAKE_AMOUNT} DOHM...")
-            r1 = retry_action(lambda: do_stake(page, STAKE_AMOUNT), tries=3, label="stake")
+            log(f"  [1/3] Stake (random {STAKE_MIN}-{STAKE_MAX}) DOHM...")
+            r1 = retry_action(lambda: do_stake(page), tries=3, label="stake")
             log(f"  -> {r1}")
             if r1 == 'browser-dead':
                 log("[SEQ] browser mati, exit")
@@ -996,8 +1078,8 @@ def run_session():
             sleep_fixed(JEDA_MIN, JEDA_MAX, "setelah stake")
 
             # ── UNSTAKE ──
-            log(f"  [2/3] Unstake {UNSTAKE_AMOUNT} sDOHM...")
-            r2 = retry_action(lambda: do_unstake(page, UNSTAKE_AMOUNT), tries=3, label="unstake")
+            log(f"  [2/3] Unstake (random {UNSTAKE_MIN}-{UNSTAKE_MAX}) sDOHM...")
+            r2 = retry_action(lambda: do_unstake(page), tries=3, label="unstake")
             log(f"  -> {r2}")
             if r2 == 'browser-dead':
                 break
